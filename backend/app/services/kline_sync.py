@@ -646,6 +646,17 @@ def fetch_minute_single(symbol: str, trade_date: date) -> pl.DataFrame:
     from datetime import datetime
     start_time = datetime(trade_date.year, trade_date.month, trade_date.day, 9, 25, 0)
     end_time = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 5, 0)
+
+    # 自定义数据源分流: minute provider
+    provider_name = preferences.get_minute_data_provider()
+    if provider_name != "tickflow":
+        from app.data_providers import custom as custom_sources
+        if custom_sources.provider_has_dataset(provider_name, "minute"):
+            provider = custom_sources.get_provider(provider_name)
+            return provider.get_minute(
+                [symbol], start_time=start_time, end_time=end_time,
+            )
+
     tf = get_client()
     try:
         raw = tf.klines.batch(

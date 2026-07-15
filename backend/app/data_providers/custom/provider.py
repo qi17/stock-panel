@@ -162,7 +162,14 @@ class GenericHTTPProvider:
         if df.is_empty():
             return df
         if "datetime" in df.columns and df.schema["datetime"] != pl.Datetime("us"):
-            df = df.with_columns(pl.col("datetime").cast(pl.Datetime("us"), strict=False))
+            if df.schema["datetime"] in (pl.Utf8, pl.Categorical):
+                df = df.with_columns(
+                    pl.col("datetime")
+                    .str.replace(" ", "T", literal=True)
+                    .cast(pl.Datetime("us"), strict=False)
+                )
+            else:
+                df = df.with_columns(pl.col("datetime").cast(pl.Datetime("us"), strict=False))
         for col in ("open", "high", "low", "close", "volume", "amount"):
             if col in df.columns:
                 df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False))
@@ -171,7 +178,20 @@ class GenericHTTPProvider:
 
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         cfg = self._dataset(dataset)
-        rows = self._request_rows(cfg, symbols=symbols or [])
+        symbols = symbols or ["600000.SH"]
+        
+        start_time = None
+        end_time = None
+        if dataset in ("daily", "minute", "adj_factor"):
+            from datetime import timedelta
+            now = datetime.now()
+            if dataset == "minute":
+                start_time = now - timedelta(days=1)
+            else:
+                start_time = now - timedelta(days=30)
+            end_time = now
+
+        rows = self._request_rows(cfg, symbols=symbols, start_time=start_time, end_time=end_time)
         df = self._mapped_frame(cfg, rows)
         return {
             "provider": self.name,

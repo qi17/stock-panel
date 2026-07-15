@@ -92,7 +92,7 @@ if [ ! -d "$BACKEND_DIR/.venv" ] || [ "${#BACKEND_EXTRA_ARGS[@]}" -gt 0 ]; then
   else
     info "后端首次启动 — 安装 Python 依赖(约 1-2 分钟)..."
   fi
-  ( cd "$BACKEND_DIR" && uv sync "${BACKEND_EXTRA_ARGS[@]}" )
+  ( cd "$BACKEND_DIR" && uv sync "${BACKEND_EXTRA_ARGS[@]+"${BACKEND_EXTRA_ARGS[@]}"}" )
   ok "后端依赖装好了"
 fi
 
