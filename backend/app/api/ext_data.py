@@ -29,6 +29,7 @@ from app.services.ext_data import (
     rows_to_parquet,
 )
 from app.services.ext_pull import fetch_and_ingest, pull_scheduler
+from app.api.data import invalidate_storage_cache
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ext-data", tags=["ext-data"])
@@ -310,6 +311,7 @@ async def fetch_preset_data(request: Request, config_id: str):
         raise HTTPException(400, f"拉取失败: {e}") from e
 
     _refresh_views(request)
+    invalidate_storage_cache()
     return {"status": "ok", "rows": n}
 
 
@@ -359,6 +361,7 @@ def delete_config(request: Request, config_id: str):
     store = _store(request)
     if not store.delete(config_id):
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
+    invalidate_storage_cache()
     return {"status": "deleted"}
 
 
@@ -474,6 +477,7 @@ async def upload_data(
 
     # 刷新 DuckDB 视图
     _refresh_views(request)
+    invalidate_storage_cache()
 
     return {"status": "ok", "rows": rows, "date": snap.isoformat()}
 
@@ -505,6 +509,7 @@ def ingest_data(request: Request, config_id: str, body: IngestReq):
     rows_written = rows_to_parquet(body.rows, config, _data_dir(request), snapshot_date=snap)
 
     _refresh_views(request)
+    invalidate_storage_cache()
 
     return {"status": "ok", "rows": rows_written, "date": snap.isoformat()}
 
@@ -604,6 +609,7 @@ async def run_pull(request: Request, config_id: str):
     try:
         n, d = await fetch_and_ingest(config, _data_dir(request))
         _refresh_views(request)
+        invalidate_storage_cache()
         # 写回执行状态, 让前端"上次执行"面板立即反映
         updated = store.get(config_id)
         if updated and updated.pull:
@@ -641,6 +647,7 @@ def fix_symbol(request: Request, config_id: str):
 
     fixed = fix_symbol_format(config, _data_dir(request))
     _refresh_views(request)
+    invalidate_storage_cache()
     return {"status": "ok", "fixed_files": fixed}
 
 

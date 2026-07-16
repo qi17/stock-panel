@@ -733,6 +733,9 @@ async def sync_minute_single(request: Request, body: dict):
     from app.jobs.daily_pipeline import _refresh_single_view
     _refresh_single_view(repo, "kline_minute")
 
+    from app.api.data import invalidate_storage_cache
+    invalidate_storage_cache()
+
     return {"status": "ok", "symbol": symbol, "rows": written}
 
 

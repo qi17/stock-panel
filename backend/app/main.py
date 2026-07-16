@@ -228,6 +228,17 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_cache_control_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        if "Cache-Control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 # ================================================================
 # 访问认证中间件
 # ================================================================
