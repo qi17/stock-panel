@@ -165,28 +165,61 @@ def get_daily(
     # 从 enriched 表读取 (已含前复权 OHLCV + 技术指标 + 信号); ETF/指数走独立存储
     df = repo.get_daily_asset(asset_type, symbol, start, end)
 
-    if df.is_empty():
+    # 自动增量同步：如果最新日期落后于全局最新 enriched 日期，或者数据为空，就触发增量更新并落盘计算
+    need_sync = False
+    if asset_type == "stock":
+        if df.is_empty():
+            need_sync = True
+        else:
+            symbol_latest_date = df["date"].max()
+            _, global_latest_date = repo.get_enriched_latest()
+            if global_latest_date and symbol_latest_date < global_latest_date:
+                need_sync = True
+
+    if need_sync:
         try:
-            raw = kline_sync.sync_daily_batch([symbol], count=days + 30)
+            logger.info("检测到股票 %s 滞后或无数据，正在触发增量同步与指标重算...", symbol)
+            capset = getattr(request.app.state, "capabilities", None)
+            
+            # 1. 增量获取 raw 并持久化到 kline_daily
+            kline_sync.sync_and_persist_daily_batch([symbol], repo=repo, capset=capset, count=days + 30)
+            
+            # 2. 从本地 kline_daily 读取 raw parquet 数据计算 enriched 并落盘到 kline_daily_enriched
+            raw_glob = str(repo.store.data_dir / "kline_daily" / "**" / "*.parquet")
+            warmup_start = start - timedelta(days=150)
+            raw = (
+                pl.scan_parquet(raw_glob)
+                .filter(
+                    (pl.col("symbol") == symbol)
+                    & (pl.col("date") >= warmup_start)
+                    & (pl.col("date") <= end)
+                )
+                .sort("date")
+                .collect()
+            )
+            
+            if not raw.is_empty():
+                factors = pl.DataFrame()
+                try:
+                    from app.tickflow.capabilities import Cap
+                    if capset and capset.has(Cap.ADJ_FACTOR):
+                        factors = kline_sync.fetch_adj_factor_single(symbol)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
+                
+                enriched = compute_enriched(raw, factors=factors)
+                if not enriched.is_empty():
+                    repo.append_enriched(enriched)
+                    repo.clear_cache()
+                    logger.info("股票 %s enriched 数据落盘并刷新内存缓存成功", symbol)
+            
+            # 3. 重新读取已计算完并持久化的 enriched 数据
+            df = repo.get_daily_asset(asset_type, symbol, start, end)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"TickFlow fetch failed: {e}") from e
-        if raw.is_empty():
-            return {"symbol": symbol, "name": stock_name, "stock_info": stock_info, "rows": []}
-        # 拉除权因子做前复权 (Starter+ 有权限), 否则空 df → compute_enriched 退回未复权
-        factors = pl.DataFrame()
-        capset = getattr(request.app.state, "capabilities", None)
-        try:
-            from app.tickflow.capabilities import Cap
-            if capset and capset.has(Cap.ADJ_FACTOR):
-                factors = kline_sync.fetch_adj_factor_single(symbol)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("单股除权因子拉取失败 %s: %s", symbol, e)
-        enriched = compute_enriched(raw, factors=factors)
-        rows = enriched.tail(days).to_dicts()
-        # 即使 live 模式也尝试追加实时蜡烛
-        rows = _maybe_inject_live_candle(request, symbol, rows, asset_type)
-        resp = {"symbol": symbol, "name": stock_name, "stock_info": stock_info, "rows": rows, "source": "live"}
-        return _attach_ext(resp, repo, symbol, ext_columns)
+            logger.warning("on-the-fly sync and enriched build failed for %s: %s", symbol, e)
+
+    if df.is_empty():
+        return {"symbol": symbol, "name": stock_name, "stock_info": stock_info, "rows": []}
 
     rows = df.to_dicts()
 

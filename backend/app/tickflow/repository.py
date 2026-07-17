@@ -552,8 +552,8 @@ class KlineRepository:
                     logger.info("enriched 历史缓存: %d rows, %s ~ %s",
                                 len(df_full), self._enriched_history_start, latest)
 
-                    # 只取最新一天作为 enriched_cache
-                    df_today = df_full.filter(pl.col("date") == latest)
+                    # 提取每个 symbol 最后一天的最新记录作为 enriched 缓存，避免因部分个股未同步到最新一日导致指标全是 null
+                    df_today = df_full.unique(subset=["symbol"], keep="last")
                     if not df_today.is_empty():
                         self._enriched_cache = df_today
                         self._enriched_cache_date = latest
@@ -851,7 +851,7 @@ class KlineRepository:
                 self._etf_enriched_cache = df_latest.sort(["symbol"])
             else:
                 df_full = compute_signals(compute_indicators(df_hist))
-                self._etf_enriched_cache = df_full.filter(pl.col("date") == latest).sort(["symbol"])
+                self._etf_enriched_cache = df_full.unique(subset=["symbol"], keep="last").sort(["symbol"])
             self._etf_enriched_cache_date = latest
         except Exception as e:  # noqa: BLE001
             logger.debug("ETF enriched 缓存刷新跳过: %s", e)

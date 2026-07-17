@@ -96,9 +96,9 @@ class GenericHTTPProvider:
                 on_chunk_done(i + 1, len(chunks))
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
-    def get_realtime(self) -> list[dict]:
+    def get_realtime(self, symbols: list[str] | None = None) -> list[dict]:
         cfg = self._dataset("realtime")
-        rows = self._request_rows(cfg)
+        rows = self._request_rows(cfg, symbols=symbols)
         df = self._mapped_frame(cfg, rows)
         if df.is_empty():
             return []
@@ -248,6 +248,12 @@ class GenericHTTPProvider:
         else:
             request_kwargs["params"] = auth_params
             request_kwargs["json"] = body
+            
+        logger.info(
+            "Custom Provider [%s] Request: %s %s | Params: %s | Body: %s", 
+            self.name, method, cfg.url, request_kwargs.get("params"), request_kwargs.get("json")
+        )
+        
         resp = self._client.request(method, cfg.url, **request_kwargs)
         resp.raise_for_status()
         return extract_rows(resp.json(), cfg.response_path)

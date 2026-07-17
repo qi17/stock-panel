@@ -540,10 +540,14 @@ class QuoteService:
             before = self._fetched_at
             if final:
                 logger.info("最终行情同步开始")
-            if self.realtime_mode() == "watchlist":
-                self._fetch_watchlist_quotes()
-            else:
+            
+            # 无论处于什么级别(Starter/Pro等)，优先拉取一次自选股
+            # 这样即使用户在使用 TDX 获取全市场(较慢)时，前端的自选股也能做到秒级响应
+            self._fetch_watchlist_quotes()
+            
+            if self.realtime_mode() != "watchlist":
                 self._fetch_full_market_quotes()
+                
             return self._fetched_at > before
 
     def _fetch_full_market_quotes(self) -> None:
@@ -719,12 +723,30 @@ class QuoteService:
     def _fetch_watchlist_quotes(self) -> None:
         """Free 档自选股实时: 只拉取最多 5 个 symbols。"""
         from app.services import preferences
-        from app.tickflow.client import get_paid_realtime_client
 
         symbols = preferences.get_realtime_watchlist_symbols()
         if not symbols:
             logger.info("自选实时未配置标的, 跳过行情拉取")
             return
+
+        provider_name = preferences.get_realtime_data_provider()
+        if provider_name != "tickflow":
+            from app.data_providers import custom as custom_sources
+            if custom_sources.provider_has_dataset(provider_name, "realtime"):
+                try:
+                    t0 = time.perf_counter()
+                    now_ts = time.perf_counter()
+                    records = custom_sources.get_provider(provider_name).get_realtime(symbols=symbols)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("自选自定义实时拉取失败: %s", e)
+                    return
+                # 把 record 的内容装载成和 tickflow 类似的格式再进入原有处理逻辑
+                # 或者复用 _process_full_market_records？ 不，_fetch_watchlist_quotes 原有逻辑是自己组装 records 的
+                # 为了保持对下游处理的兼容，下面直接把 custom 返回的 records 传入处理
+                self._process_watchlist_records(records, symbols, t0=t0, now_ts=now_ts)
+                return
+
+        from app.tickflow.client import get_paid_realtime_client
 
         tf = get_paid_realtime_client()
         if tf is None:
@@ -743,19 +765,22 @@ class QuoteService:
             logger.warning("自选实时行情数据为空")
             return
 
-        records = []
-        for q in resp:
+        self._process_watchlist_records(resp, symbols, t0=t0, now_ts=now_ts)
+
+    def _process_watchlist_records(self, records: list[dict], symbols: list[str], t0: float, now_ts: float) -> None:
+        """Process API records (either from Custom Provider or TickFlow) into daily and quote_extra DataFrames."""
+        processed_records = []
+        for q in records:
             ext = q.get("ext") or {}
             last_price = q.get("last_price")
             prev_close = q.get("prev_close")
-            change_amount = ext.get("change_amount")
-            change_pct = ext.get("change_pct")
+            change_amount = q.get("change_amount") or ext.get("change_amount")
+            change_pct = q.get("change_pct") or ext.get("change_pct")
             if change_amount is None and last_price is not None and prev_close is not None:
                 change_amount = float(last_price) - float(prev_close)
             if change_pct is None and change_amount is not None and prev_close not in (None, 0):
-                # 小数制, 与 ext.change_pct / enriched 口径一致 (不乘 100)
                 change_pct = float(change_amount) / float(prev_close)
-            records.append({
+            processed_records.append({
                 "symbol": q.get("symbol"),
                 "name": q.get("name") or ext.get("name"),
                 "last_price": last_price,
@@ -767,8 +792,8 @@ class QuoteService:
                 "amount": q.get("amount"),
                 "change_pct": change_pct,
                 "change_amount": change_amount,
-                "amplitude": ext.get("amplitude"),
-                "turnover_rate": ext.get("turnover_rate"),
+                "amplitude": q.get("amplitude") or ext.get("amplitude"),
+                "turnover_rate": q.get("turnover_rate") or ext.get("turnover_rate"),
                 "timestamp": q.get("timestamp"),
                 "session": q.get("session"),
             })
@@ -779,16 +804,16 @@ class QuoteService:
             self._fetch_time = now_ts
             self._fetch_ms = fetch_ms
             self._fetched_at = fetched_at
-            self._symbol_count = len(records)
+            self._symbol_count = len(processed_records)
             self._index_symbol_count = 0
             self._etf_symbol_count = 0
             self._index_quotes_cache = None
 
         _persist_last_fetch(fetched_at)
-        logger.info("自选实时刷新: %d 只股票, 耗时 %.0fms", len(records), fetch_ms)
+        logger.info("自选实时刷新: %d 只股票, 耗时 %.0fms", len(processed_records), fetch_ms)
 
-        daily_df = self._build_daily(records)
-        quote_extra = self._build_quote_extra(records)
+        daily_df = self._build_daily(processed_records)
+        quote_extra = self._build_quote_extra(processed_records)
         if not daily_df.is_empty() and self._repo:
             try:
                 self._repo.merge_live_daily_asset("stock", daily_df)

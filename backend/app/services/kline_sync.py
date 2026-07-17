@@ -168,17 +168,48 @@ def sync_and_persist_daily_batch(
         return 0
 
     provider_name = preferences.get_daily_data_provider()
-    # 全量/大跨度同步（跨度 > 15 天）自动临时路由到 tickflow，增量同步走自定义行情源(TDX)
-    is_large_sync = False
-    if start_date:
-        is_large_sync = (datetime.now() - start_date).days > 15
-    else:
-        is_large_sync = True
+    # 只在批量同步（多于 100 只股票）时自动临时路由到 tickflow，其余单股或增量同步走自定义行情源(TDX)
+    is_large_sync = len(symbols) > 100
 
     current_provider = provider_name
     if is_large_sync and provider_name != "tickflow":
-        logger.info("检测为全量/大时间跨度同步(超过15天)，自动临时切换数据源为 tickflow 以加速下载")
+        logger.info("检测为全量/大时间跨度同步(超过100只股票)，自动临时切换数据源为 tickflow 以加速下载")
         current_provider = "tickflow"
+
+    # 如果决定走 tickflow，但没有权限或者执行失败，则自动降级使用用户的自定义源（TDX）
+    if current_provider == "tickflow":
+        from app.tickflow.capabilities import Cap
+        if capset and capset.has(Cap.KLINE_DAILY_BATCH):
+            try:
+                limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH, default_batch=100)
+                end_time = end_date or datetime.now()
+                start_time = start_date or (end_time - timedelta(days=365))
+                df = sync_daily_batch(
+                    symbols, count=count, batch_size=limit.batch, rpm=limit.rpm,
+                    start_time=start_time, end_time=end_time,
+                    on_chunk_done=on_chunk_done,
+                )
+                if not df.is_empty():
+                    repo.append_daily(df)
+                    try:
+                        d = repo.store.data_dir.as_posix()
+                        repo.db.execute(
+                            f"""CREATE OR REPLACE VIEW kline_daily AS
+                                SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("refresh view failed: %s", e)
+                    return df.height
+            except Exception as e:
+                logger.warning("TickFlow 全量同步失败: %s，将自动降级尝试使用自定义源...", e)
+        else:
+            logger.info("当前能力集无 KLINE_DAILY_BATCH 权限，将自动降级使用自定义源...")
+
+        # 降级：切换到自定义源
+        if provider_name != "tickflow":
+            current_provider = provider_name
+        else:
+            return 0
 
     if current_provider != "tickflow":
         from app.data_providers import custom as custom_sources
@@ -205,37 +236,8 @@ def sync_and_persist_daily_batch(
             except Exception as e:  # noqa: BLE001
                 logger.warning("refresh view failed: %s", e)
             return df.height
-        # 自定义源未配置 daily → 回退 TickFlow
 
-    if not capset.has(Cap.KLINE_DAILY_BATCH):
-        return 0
-
-    limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH, default_batch=100)
-
-    end_time = end_date or datetime.now()
-    start_time = start_date or (end_time - timedelta(days=365))
-
-    df = sync_daily_batch(
-        symbols, count=count, batch_size=limit.batch, rpm=limit.rpm,
-        start_time=start_time, end_time=end_time,
-        on_chunk_done=on_chunk_done,
-    )
-
-    if df.is_empty():
-        return 0
-
-    repo.append_daily(df)
-
-    try:
-        d = repo.store.data_dir.as_posix()
-        repo.db.execute(
-            f"""CREATE OR REPLACE VIEW kline_daily AS
-                SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("refresh view failed: %s", e)
-
-    return df.height
+    return 0
 
 
 def sync_daily_by_quotes(repo: KlineRepository) -> int:
@@ -705,11 +707,27 @@ def fetch_minute_single(symbol: str, trade_date: date) -> pl.DataFrame:
 
 
 def fetch_adj_factor_single(symbol: str) -> pl.DataFrame:
-    """从 TickFlow 实时拉取单股除权因子(不写入本地), 用于单股 K 线即时前复权。
+    """从 自定义行情源/TickFlow 实时拉取单股除权因子(不写入本地), 用于单股 K 线即时前复权。
 
     返回结构: symbol, trade_date, ex_factor (空 DataFrame 表示无除权事件或拉取失败)。
     与 _apply_adj_factor / compute_enriched 的 factors 参数格式一致。
     """
+    adj_provider = preferences.get_adj_factor_provider()
+    if adj_provider == "same_as_daily":
+        adj_provider = preferences.get_daily_data_provider()
+
+    if adj_provider != "tickflow":
+        from app.data_providers import custom as custom_sources
+        if custom_sources.provider_has_dataset(adj_provider, "adj_factor"):
+            provider = custom_sources.get_provider(adj_provider)
+            try:
+                # 实时除权因子拉取，传递 None 即可拉取全部历史
+                df = provider.get_adj_factors([symbol], start_time=None, end_time=None)
+                if not df.is_empty():
+                    return df
+            except Exception as e:
+                logger.warning("custom provider get_adj_factors(%s) failed: %s", symbol, e)
+
     tf = get_client()
     try:
         raw = tf.klines.ex_factors([symbol], as_dataframe=True, show_progress=False)
