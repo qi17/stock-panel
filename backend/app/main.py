@@ -20,10 +20,26 @@ from app.tickflow import client as tf_client
 from app.tickflow.policy import detect_capabilities
 from app.tickflow.repository import DataStore, KlineRepository
 
-logging.basicConfig(
-    level=settings.log_level,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+from logging.handlers import RotatingFileHandler
+
+# 配置文件日志输出目录
+log_dir = Path(getattr(settings, "data_dir", ".")) / "logs"
+log_dir.mkdir(parents=True, exist_ok=True)
+log_file = log_dir / "backend.log"
+
+file_handler = RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+root_logger = logging.getLogger()
+root_logger.setLevel(settings.log_level)
+# 避免重复 handler
+if not root_logger.handlers:
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
+
 logger = logging.getLogger(__name__)
 
 

@@ -552,8 +552,8 @@ class KlineRepository:
                     logger.info("enriched 历史缓存: %d rows, %s ~ %s",
                                 len(df_full), self._enriched_history_start, latest)
 
-                    # 提取每个 symbol 最后一天的最新记录作为 enriched 缓存，避免因部分个股未同步到最新一日导致指标全是 null
-                    df_today = df_full.unique(subset=["symbol"], keep="last")
+                    # 严格按最新日期过滤, 避免历史未覆盖完全时将上一交易日旧数据混入最新日缓存
+                    df_today = df_full.filter(pl.col("date") == latest)
                     if not df_today.is_empty():
                         self._enriched_cache = df_today
                         self._enriched_cache_date = latest
@@ -851,7 +851,7 @@ class KlineRepository:
                 self._etf_enriched_cache = df_latest.sort(["symbol"])
             else:
                 df_full = compute_signals(compute_indicators(df_hist))
-                self._etf_enriched_cache = df_full.unique(subset=["symbol"], keep="last").sort(["symbol"])
+                self._etf_enriched_cache = df_full.filter(pl.col("date") == latest).sort(["symbol"])
             self._etf_enriched_cache_date = latest
         except Exception as e:  # noqa: BLE001
             logger.debug("ETF enriched 缓存刷新跳过: %s", e)
@@ -1860,55 +1860,13 @@ class KlineRepository:
         self.flush_live_daily_asset("stock", df)
 
     def flush_live_daily_asset(self, asset_type: str, df: pl.DataFrame) -> None:
-        """覆写当天指定资产日K分区 (实时行情落盘, 非merge)。"""
-        if df.is_empty() or "date" not in df.columns:
-            return
-        table = {
-            "stock": "kline_daily",
-            "index": "kline_index_daily",
-            "etf": "kline_etf_daily",
-        }.get(asset_type)
-        if not table:
-            return
-        base = self.store.data_dir / table
-        dt = df["date"][0]
-        ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-        out = base / f"date={ds}" / "part.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with self._write_lock:
-            self._atomic_write_parquet(df.sort(["symbol", "date"]), out)
+        """写入当天指定资产日K分区 (自动增量合并，防止覆写丢失)。"""
+        self.merge_live_daily_asset(asset_type, df)
 
     def flush_live_enriched(self, df: pl.DataFrame) -> None:
-        """覆写当天 kline_daily_enriched 分区 (实时 enriched 落盘, 非merge)。
-
-        内存缓存保留完整指标列供各服务使用，磁盘仅写入 14 列存储列。
-        """
+        """写入当天 kline_daily_enriched 分区 (自动增量合并，防止覆写丢失)。"""
         self.flush_live_enriched_asset("stock", df)
 
     def flush_live_enriched_asset(self, asset_type: str, df: pl.DataFrame) -> None:
-        """覆写当天指定资产 enriched 分区 (实时 enriched 落盘, 非merge)。"""
-        if df.is_empty() or "date" not in df.columns:
-            return
-        dt = df["date"][0]
-        if asset_type == "stock":
-            self._enriched_cache = df.sort(["symbol"])
-            self._enriched_cache_date = dt
-            table = "kline_daily_enriched"
-        elif asset_type == "etf":
-            self._etf_enriched_cache = df.sort(["symbol"])
-            self._etf_enriched_cache_date = dt
-            table = "kline_etf_enriched"
-        elif asset_type == "index":
-            table = "kline_index_enriched"
-        else:
-            return
-
-        from app.indicators.pipeline import ENRICHED_STORAGE_COLS
-        storage_cols = [c for c in ENRICHED_STORAGE_COLS if c in df.columns]
-        df_storage = df.select(storage_cols).sort(["symbol"])
-        base = self.store.data_dir / table
-        ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
-        out = base / f"date={ds}" / "part.parquet"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with self._write_lock:
-            self._atomic_write_parquet(df_storage, out)
+        """写入当天指定资产 enriched 分区 (自动增量合并，防止覆写丢失)。"""
+        self.merge_live_enriched_asset(asset_type, df)

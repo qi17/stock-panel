@@ -225,6 +225,8 @@ class ScreenerService:
         cache, cache_date = self.repo.get_enriched_latest_asset(self.asset_type)
         if cache is not None and not cache.is_empty() and cache_date == target_date:
             df = cache
+            if "date" in df.columns:
+                df = df.filter(pl.col("date") == target_date)
             # JOIN instruments
             df_i = self.repo.get_instruments_asset(self.asset_type)
             if not df_i.is_empty():

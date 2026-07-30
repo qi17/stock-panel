@@ -8,7 +8,7 @@
 import { useState, type CSSProperties, type ReactNode } from 'react'
 import { Check, Plus, Eye, EyeOff, RefreshCw } from 'lucide-react'
 import type { KlineRow, MinuteKlineRow } from '@/lib/api'
-import { fmtPrice } from '@/lib/format'
+import { fmtPrice, fmtBigNum, priceColorClass, getExtNumColorClass } from '@/lib/format'
 import type { ColumnConfig } from '@/lib/screener-columns'
 import { getSignals, signalCls } from '@/lib/stock-table'
 import { boardTag, renderBuiltinDataCell } from '@/components/stock-table/primitives'
@@ -105,8 +105,10 @@ function renderExtValue(
 ): ReactNode {
   if (val == null || Number.isNaN(val)) return <span className="text-muted">—</span>
   if (typeof val === 'number') {
-    const displayVal = Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val)
-    return <span className="tabular-nums">{displayVal}</span>
+    const displayVal = Math.abs(val) >= 10000 ? fmtBigNum(val) : (Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val))
+    const fieldName = col.source.type === 'ext' ? col.source.fieldName : ''
+    const colorCls = getExtNumColorClass(val, fieldName, col.label)
+    return <span className={`tabular-nums ${colorCls}`}>{displayVal}</span>
   }
   if (typeof val === 'boolean') {
     return <span className={val ? 'text-bull' : 'text-muted'}>{val ? '是' : '否'}</span>

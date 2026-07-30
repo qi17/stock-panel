@@ -34,7 +34,7 @@ class GenericHTTPProvider:
     def __init__(self, config: CustomSourceConfig) -> None:
         self.config = config
         self.name = config.name
-        self._client = httpx.Client(timeout=30.0)
+        self._client = httpx.Client(timeout=180.0, limits=httpx.Limits(max_keepalive_connections=0))
 
     def close(self) -> None:
         self._client.close()
@@ -85,9 +85,34 @@ class GenericHTTPProvider:
         cfg = self._dataset("adj_factor")
         frames: list[pl.DataFrame] = []
         chunks = chunked(symbols, cfg.batch)
+
+        # 批量读取本地 kline_daily parquet，构建 {symbol: {date_str: close}} 供 tdx-api-server 直接使用，
+        # 跳过其内部逐只股票向 TDX 拉取 K 线的网络请求，大幅提速
+        local_closes: dict[str, dict[str, float]] = {}
+        try:
+            kline_dir = settings.data_dir / "kline_daily"
+            if kline_dir.exists():
+                df_all = pl.scan_parquet(
+                    str(kline_dir / "**" / "*.parquet"),
+                    extra_columns="ignore",
+                ).select(["symbol", "date", "close"]).collect()
+                for row in df_all.iter_rows(named=True):
+                    sym = row["symbol"]
+                    d = str(row["date"])[:10]
+                    if sym not in local_closes:
+                        local_closes[sym] = {}
+                    local_closes[sym][d] = float(row["close"])
+                logger.info("get_adj_factors: 本地 kline_daily 已加载 %d 只股票收盘价", len(local_closes))
+        except Exception as e:
+            logger.warning("get_adj_factors: 本地 kline_daily 读取失败，回退至 TDX K 线查询: %s", e)
+
         for i, chunk in enumerate(chunks):
             sleep_between_batches(i, cfg.rpm)
-            rows = self._request_rows(cfg, symbols=chunk, start_time=start_time, end_time=end_time)
+            # 构建该批次的 kline_closes 子集
+            chunk_closes = {sym: local_closes[sym] for sym in chunk if sym in local_closes}
+            override_body = {"kline_closes": chunk_closes} if chunk_closes else None
+            rows = self._request_rows(cfg, symbols=chunk, start_time=start_time, end_time=end_time,
+                                      override_body=override_body)
             df = self._mapped_frame(cfg, rows)
             df = normalize_adj_factors(df, source=self.name)
             if not df.is_empty():

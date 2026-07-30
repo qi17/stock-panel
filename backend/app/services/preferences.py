@@ -191,6 +191,7 @@ _ALLOWED_DATA_PROVIDERS = {"tickflow"}
 def _allowed_data_providers() -> set[str]:
     try:
         from app.data_providers import custom as custom_sources
+        custom_sources.load_all()
         return _ALLOWED_DATA_PROVIDERS | custom_sources.names()
     except Exception:  # noqa: BLE001
         return set(_ALLOWED_DATA_PROVIDERS)

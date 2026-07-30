@@ -176,34 +176,33 @@ def sync_and_persist_daily_batch(
         logger.info("检测为全量/大时间跨度同步(超过100只股票)，自动临时切换数据源为 tickflow 以加速下载")
         current_provider = "tickflow"
 
-    # 如果决定走 tickflow，但没有权限或者执行失败，则自动降级使用用户的自定义源（TDX）
+    # 盘后日 K 批量同步：优先走 TickFlow（TickFlow 免费/付费均支持极速日 K 批量同步）
     if current_provider == "tickflow":
-        from app.tickflow.capabilities import Cap
-        if capset and capset.has(Cap.KLINE_DAILY_BATCH):
-            try:
-                limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH, default_batch=100)
-                end_time = end_date or datetime.now()
-                start_time = start_date or (end_time - timedelta(days=365))
-                df = sync_daily_batch(
-                    symbols, count=count, batch_size=limit.batch, rpm=limit.rpm,
-                    start_time=start_time, end_time=end_time,
-                    on_chunk_done=on_chunk_done,
-                )
-                if not df.is_empty():
-                    repo.append_daily(df)
-                    try:
-                        d = repo.store.data_dir.as_posix()
-                        repo.db.execute(
-                            f"""CREATE OR REPLACE VIEW kline_daily AS
-                                SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("refresh view failed: %s", e)
-                    return df.height
-            except Exception as e:
-                logger.warning("TickFlow 全量同步失败: %s，将自动降级尝试使用自定义源...", e)
-        else:
-            logger.info("当前能力集无 KLINE_DAILY_BATCH 权限，将自动降级使用自定义源...")
+        try:
+            from app.tickflow.capabilities import Cap
+            limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH, default_batch=100) if capset else None
+            batch_size = limit.batch if limit else 100
+            rpm = limit.rpm if limit else None
+            end_time = end_date or datetime.now()
+            start_time = start_date or (end_time - timedelta(days=365))
+            df = sync_daily_batch(
+                symbols, count=count, batch_size=batch_size, rpm=rpm,
+                start_time=start_time, end_time=end_time,
+                on_chunk_done=on_chunk_done,
+            )
+            if not df.is_empty():
+                repo.append_daily(df)
+                try:
+                    d = repo.store.data_dir.as_posix()
+                    repo.db.execute(
+                        f"""CREATE OR REPLACE VIEW kline_daily AS
+                            SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("refresh view failed: %s", e)
+                return df.height
+        except Exception as e:
+            logger.warning("TickFlow 日K全量同步失败: %s，将自动降级尝试使用自定义源...", e)
 
         # 降级：切换到自定义源
         if provider_name != "tickflow":
@@ -348,17 +347,7 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
     if provider_name == "same_as_daily":
         provider_name = preferences.get_daily_data_provider()
 
-    # 复权因子大跨度同步（超过 15 天）自动临时路由到 tickflow 以进行高性能转换，增量走自定义源(TDX)
-    is_large_sync = False
-    if start_time:
-        is_large_sync = (datetime.now() - start_time).days > 15
-    else:
-        is_large_sync = True
-
     current_provider = provider_name
-    if is_large_sync and provider_name != "tickflow":
-        logger.info("检测为全量/大时间跨度复权因子同步(超过15天)，自动临时切换数据源为 tickflow")
-        current_provider = "tickflow"
 
     if current_provider != "tickflow":
         from app.data_providers import custom as custom_sources

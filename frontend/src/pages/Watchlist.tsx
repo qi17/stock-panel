@@ -5,7 +5,7 @@ import { Trash2, RefreshCw, Star, X, Search, LayoutGrid, List, Settings2, Plus, 
 import { api, type KlineRow, type MinuteKlineRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { storage } from '@/lib/storage'
-import { fmtPrice, fmtPct, fmtBigNum, priceColorClass } from '@/lib/format'
+import { fmtPrice, fmtPct, fmtBigNum, priceColorClass, getExtNumColorClass } from '@/lib/format'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
 import { StockPreviewDialog } from '@/components/StockPreviewDialog'
@@ -68,9 +68,10 @@ function renderExtValue(
 ): React.ReactNode {
   if (val == null || Number.isNaN(val)) return <span className="text-muted">—</span>
   if (typeof val === 'number') {
-    // int 类型不显示小数
-    const displayVal = Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val)
-    return <span className="tabular-nums">{displayVal}</span>
+    const displayVal = Math.abs(val) >= 10000 ? fmtBigNum(val) : (Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val))
+    const fieldName = col.source.type === 'ext' ? col.source.fieldName : ''
+    const colorCls = getExtNumColorClass(val, fieldName, col.label)
+    return <span className={`tabular-nums ${colorCls}`}>{displayVal}</span>
   }
   if (typeof val === 'boolean') {
     return <span className={val ? 'text-bull' : 'text-muted'}>{val ? '是' : '否'}</span>

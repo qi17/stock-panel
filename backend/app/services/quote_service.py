@@ -721,29 +721,41 @@ class QuoteService:
         self._evaluate_monitors(daily_df, quote_extra)
 
     def _fetch_watchlist_quotes(self) -> None:
-        """Free 档自选股实时: 只拉取最多 5 个 symbols。"""
+        """自选股实时行情: 拉取全部自选标的 + 核心指数 (自定义源或 TickFlow)。"""
         from app.services import preferences
 
-        symbols = preferences.get_realtime_watchlist_symbols()
-        if not symbols:
+        provider_name = preferences.get_realtime_data_provider()
+        symbols = []
+        if provider_name != "tickflow":
+            from app.data_providers import custom as custom_sources
+            if custom_sources.provider_has_dataset(provider_name, "realtime"):
+                try:
+                    from app.services import watchlist
+                    all_rows = watchlist.list_symbols()
+                    symbols = [str((r or {}).get("symbol") or "").strip().upper() for r in all_rows]
+                    symbols = [s for s in symbols if s]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("加载自选列表失败, 回退前5个: %s", e)
+                    symbols = preferences.get_realtime_watchlist_symbols()
+        else:
+            symbols = preferences.get_realtime_watchlist_symbols()
+
+        fetch_symbols = list(dict.fromkeys([*symbols, *self.CORE_INDEX_SYMBOLS]))
+        if not fetch_symbols:
             logger.info("自选实时未配置标的, 跳过行情拉取")
             return
 
-        provider_name = preferences.get_realtime_data_provider()
         if provider_name != "tickflow":
             from app.data_providers import custom as custom_sources
             if custom_sources.provider_has_dataset(provider_name, "realtime"):
                 try:
                     t0 = time.perf_counter()
                     now_ts = time.perf_counter()
-                    records = custom_sources.get_provider(provider_name).get_realtime(symbols=symbols)
+                    records = custom_sources.get_provider(provider_name).get_realtime(symbols=fetch_symbols)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("自选自定义实时拉取失败: %s", e)
                     return
-                # 把 record 的内容装载成和 tickflow 类似的格式再进入原有处理逻辑
-                # 或者复用 _process_full_market_records？ 不，_fetch_watchlist_quotes 原有逻辑是自己组装 records 的
-                # 为了保持对下游处理的兼容，下面直接把 custom 返回的 records 传入处理
-                self._process_watchlist_records(records, symbols, t0=t0, now_ts=now_ts)
+                self._process_watchlist_records(records, fetch_symbols, t0=t0, now_ts=now_ts)
                 return
 
         from app.tickflow.client import get_paid_realtime_client
@@ -756,7 +768,7 @@ class QuoteService:
         t0 = time.perf_counter()
         now_ts = time.perf_counter()
         try:
-            resp = tf.quotes.get(symbols=symbols) or []
+            resp = tf.quotes.get(symbols=fetch_symbols) or []
         except Exception as e:  # noqa: BLE001
             logger.warning("自选实时拉取失败: %s", e)
             return
@@ -765,10 +777,11 @@ class QuoteService:
             logger.warning("自选实时行情数据为空")
             return
 
-        self._process_watchlist_records(resp, symbols, t0=t0, now_ts=now_ts)
+        self._process_watchlist_records(resp, fetch_symbols, t0=t0, now_ts=now_ts)
+
 
     def _process_watchlist_records(self, records: list[dict], symbols: list[str], t0: float, now_ts: float) -> None:
-        """Process API records (either from Custom Provider or TickFlow) into daily and quote_extra DataFrames."""
+        """Process API records (either from Custom Provider or TickFlow) into daily, quote_extra DataFrames, and index quotes cache."""
         processed_records = []
         for q in records:
             ext = q.get("ext") or {}
@@ -798,22 +811,30 @@ class QuoteService:
                 "session": q.get("session"),
             })
 
+        all_index_symbols = set(self.CORE_INDEX_SYMBOLS)
+        if self._repo:
+            all_index_symbols.update(self._repo.get_index_symbol_set())
+
+        index_records = [r for r in processed_records if r.get("symbol") in all_index_symbols]
+        stock_records = [r for r in processed_records if r.get("symbol") not in all_index_symbols]
+
         fetch_ms = (time.perf_counter() - t0) * 1000
         fetched_at = time.time() * 1000
         with self._lock:
             self._fetch_time = now_ts
             self._fetch_ms = fetch_ms
             self._fetched_at = fetched_at
-            self._symbol_count = len(processed_records)
-            self._index_symbol_count = 0
+            self._symbol_count = len(stock_records)
+            self._index_symbol_count = len(index_records)
             self._etf_symbol_count = 0
-            self._index_quotes_cache = None
+            if index_records:
+                self._index_quotes_cache = self._build_index_quotes(index_records)
 
         _persist_last_fetch(fetched_at)
-        logger.info("自选实时刷新: %d 只股票, 耗时 %.0fms", len(processed_records), fetch_ms)
+        logger.info("自选实时刷新: %d 只股票, %d 只指数, 耗时 %.0fms", len(stock_records), len(index_records), fetch_ms)
 
-        daily_df = self._build_daily(processed_records)
-        quote_extra = self._build_quote_extra(processed_records)
+        daily_df = self._build_daily(stock_records)
+        quote_extra = self._build_quote_extra(stock_records)
         if not daily_df.is_empty() and self._repo:
             try:
                 self._repo.merge_live_daily_asset("stock", daily_df)
@@ -1303,6 +1324,13 @@ class QuoteService:
             )
 
             if use_incremental:
+                # 校验基准数据完整性。如昨日 enriched 覆盖率严重不足 (例如之前处于自选档, 仅落盘数只),
+                # 无法为全市场提供递推状态。此时应强制走全量路径以重建全市场基准。
+                if len(prev_enriched) < len(daily_df) * 0.8:
+                    logger.info("昨日 enriched 覆盖率不足 (%d/%d), 强制走全量计算重建基准", len(prev_enriched), len(daily_df))
+                    use_incremental = False
+
+            if use_incremental:
                 from app.indicators.pipeline import compute_enriched_today
                 from app.market_time import trading_minutes_elapsed_from_ts, trading_minutes_elapsed
                 instruments = self._repo.get_instruments()
@@ -1318,13 +1346,95 @@ class QuoteService:
                         elapsed_minutes = trading_minutes_elapsed_from_ts(valid_ts.median())
                 if elapsed_minutes is None:
                     elapsed_minutes = trading_minutes_elapsed()
-                enriched_today = compute_enriched_today(
-                    live_agg=live_agg,
-                    prev_enriched=prev_enriched,
-                    today_ohlcv=today_ohlcv,
-                    instruments=instruments,
-                    elapsed_minutes=elapsed_minutes,
-                )
+
+                # 对比 symbol 集合。如果有新加入自选或昨日缺失的股票(在 live_agg 中找不到状态),
+                # 为避免它们被 inner join 过滤丢弃，我们对其进行局部全量计算。
+                live_agg_symbols = set(live_agg["symbol"].to_list())
+                today_symbols = set(today_ohlcv["symbol"].to_list())
+                missing_symbols = today_symbols - live_agg_symbols
+
+                enriched_today = pl.DataFrame()
+                if not live_agg.is_empty():
+                    inc_ohlcv = today_ohlcv.filter(pl.col("symbol").is_in(list(live_agg_symbols)))
+                    if not inc_ohlcv.is_empty():
+                        enriched_today = compute_enriched_today(
+                            live_agg=live_agg,
+                            prev_enriched=prev_enriched,
+                            today_ohlcv=inc_ohlcv,
+                            instruments=instruments,
+                            elapsed_minutes=elapsed_minutes,
+                        )
+
+                if missing_symbols:
+                    from datetime import timedelta
+                    from app.indicators.pipeline import compute_enriched
+
+                    logger.info("增量计算发现缺失/新标的 %d 只, 执行局部全量计算", len(missing_symbols))
+                    cutoff = today - timedelta(days=90)
+                    table = "kline_etf_daily" if asset_type == "etf" else "kline_daily"
+                    daily_glob = str(self._repo.store.data_dir / table / "**" / "*.parquet")
+                    ohlcv_cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount", "quote_ts"]
+
+                    hist_df = (
+                        scan_daily_parquet(daily_glob)
+                        .filter((pl.col("date") >= cutoff) & pl.col("symbol").is_in(list(missing_symbols)))
+                        .sort(["symbol", "date"])
+                        .collect()
+                    )
+
+                    hist_cols = [c for c in ohlcv_cols if c in hist_df.columns]
+                    hist_df = hist_df.select(hist_cols).filter(pl.col("date") != today)
+                    missing_ohlcv = today_ohlcv.filter(pl.col("symbol").is_in(list(missing_symbols)))
+                    daily_ohlcv = missing_ohlcv.select([c for c in ohlcv_cols if c in missing_ohlcv.columns])
+
+                    full_df = pl.concat([hist_df, daily_ohlcv], how="diagonal_relaxed")
+                    full_df = full_df.sort(["symbol", "date"])
+
+                    factor_dir = "adj_factor_etf" if asset_type == "etf" else "adj_factor"
+                    factor_path = self._repo.store.data_dir / factor_dir / "all.parquet"
+                    factors = pl.DataFrame()
+                    if factor_path.exists():
+                        try:
+                            factors = pl.read_parquet(factor_path)
+                        except Exception:
+                            pass
+
+                    missing_enriched_full = compute_enriched(full_df, factors=factors, instruments=instruments)
+                    missing_enriched_today = missing_enriched_full.filter(pl.col("date") == today)
+
+                    # quote_extra 含 API 直接返回的真实 prev_close, 优先覆盖全量计算结果.
+                    # 全量路径用 close.shift(1) 推算前收盘, 若历史分区有缺口(如昨日未落盘)则
+                    # 会拿错误的前收盘价, 导致 change_pct / change_amount 出现明显偏差.
+                    if (
+                        not missing_enriched_today.is_empty()
+                        and quote_extra is not None
+                        and not quote_extra.is_empty()
+                    ):
+                        q_cols = ["symbol"]
+                        for _qc in ("prev_close", "change_pct", "change_amount"):
+                            if _qc in quote_extra.columns:
+                                q_cols.append(_qc)
+                        if len(q_cols) > 1:
+                            q_sub = quote_extra.filter(
+                                pl.col("symbol").is_in(list(missing_symbols))
+                            ).select(q_cols)
+                            if not q_sub.is_empty():
+                                # Drop 旧列再 LEFT JOIN 新值
+                                drop_cols = [c for c in q_cols if c != "symbol" and c in missing_enriched_today.columns]
+                                if drop_cols:
+                                    missing_enriched_today = missing_enriched_today.drop(drop_cols)
+                                missing_enriched_today = missing_enriched_today.join(q_sub, on="symbol", how="left")
+                                logger.debug(
+                                    "缺失标的 %d 只 change_pct 已用 quote_extra 真实值覆盖", len(q_sub)
+                                )
+
+                    if not missing_enriched_today.is_empty():
+                        if enriched_today.is_empty():
+                            enriched_today = missing_enriched_today
+                        else:
+                            enriched_today = pl.concat([enriched_today, missing_enriched_today], how="diagonal_relaxed")
+
+
                 if enriched_today.is_empty():
                     logger.warning("增量计算结果为空, 回退到全量计算")
                     use_incremental = False
@@ -1368,6 +1478,25 @@ class QuoteService:
 
                 enriched_full = compute_enriched(full_df, factors=factors, instruments=instruments)
                 enriched_today = enriched_full.filter(pl.col("date") == today)
+
+                # quote_extra 含 API 真实 prev_close, 优先覆盖全量算法的 close.shift(1) 结果
+                if (
+                    not enriched_today.is_empty()
+                    and quote_extra is not None
+                    and not quote_extra.is_empty()
+                ):
+                    q_cols = ["symbol"]
+                    for _qc in ("prev_close", "change_pct", "change_amount"):
+                        if _qc in quote_extra.columns:
+                            q_cols.append(_qc)
+                    if len(q_cols) > 1:
+                        q_sub = quote_extra.select(q_cols)
+                        if not q_sub.is_empty():
+                            drop_cols = [c for c in q_cols if c != "symbol" and c in enriched_today.columns]
+                            if drop_cols:
+                                enriched_today = enriched_today.drop(drop_cols)
+                            enriched_today = enriched_today.join(q_sub, on="symbol", how="left")
+                            logger.debug("全量路径 %d 只 change_pct 已用 quote_extra 真实值覆盖", len(q_sub))
 
             if enriched_today.is_empty():
                 return

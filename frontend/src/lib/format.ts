@@ -13,8 +13,9 @@ export function fmtPct(v: number | null | undefined, digits = 2): string {
 
 export function fmtVolume(v: number | null | undefined): string {
   if (v == null || Number.isNaN(v)) return '—'
-  if (v >= 1e8) return `${(v / 1e8).toFixed(2)}亿`
-  if (v >= 1e4) return `${(v / 1e4).toFixed(2)}万`
+  const abs = Math.abs(v)
+  if (abs >= 1e8) return `${(v / 1e8).toFixed(2)}亿`
+  if (abs >= 1e4) return `${(v / 1e4).toFixed(2)}万`
   return v.toFixed(0)
 }
 
@@ -24,11 +25,28 @@ export function priceColorClass(v: number | null | undefined): string {
   return v > 0 ? 'text-bull' : 'text-bear'
 }
 
+/** 扩展数据数值语义配色：inflow(流入)=红，outflow(流出)=绿，net(净流入)=正红负绿 */
+export function getExtNumColorClass(v: number | null | undefined, fieldName?: string, label?: string): string {
+  if (v == null || Number.isNaN(v) || v === 0) return 'text-muted'
+  const key = `${fieldName || ''} ${label || ''}`.toLowerCase()
+  if (key.includes('net') || key.includes('净')) {
+    return v > 0 ? 'text-bull' : 'text-bear'
+  }
+  if (key.includes('outflow') || key.includes('流出')) {
+    return 'text-bear'
+  }
+  if (key.includes('inflow') || key.includes('流入')) {
+    return 'text-bull'
+  }
+  return v > 0 ? 'text-bull' : 'text-bear'
+}
+
 export function fmtBigNum(v: number | null | undefined): string {
   if (v == null || Number.isNaN(v)) return '—'
-  if (v >= 1_000_000_000_000) return `${(v / 1_000_000_000_000).toFixed(2)}万亿`
-  if (v >= 100_000_000) return `${(v / 100_000_000).toFixed(2)}亿`
-  if (v >= 10_000) return `${(v / 10_000).toFixed(0)}万`
+  const abs = Math.abs(v)
+  if (abs >= 1_000_000_000_000) return `${(v / 1_000_000_000_000).toFixed(2)}万亿`
+  if (abs >= 100_000_000) return `${(v / 100_000_000).toFixed(2)}亿`
+  if (abs >= 10_000) return `${(v / 10_000).toFixed(0)}万`
   return v.toFixed(0)
 }
 

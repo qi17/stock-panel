@@ -136,9 +136,12 @@ echo -e "${BLUE}│${NC}  Ctrl-C 同时关闭两端                          ${B
 echo -e "${BLUE}╰──────────────────────────────────────────────╯${NC}"
 echo
 
+mkdir -p "$ROOT/logs"
+
 (
   cd "$BACKEND_DIR"
   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port "$BACKEND_PORT" 2>&1 \
+    | tee -a "$ROOT/logs/backend.log" \
     | prefix_awk "$(printf "${BLUE}[backend ]${NC} ")"
 ) &
 PIDS+=("$!")
@@ -146,6 +149,7 @@ PIDS+=("$!")
 (
   cd "$FRONTEND_DIR"
   pnpm dev --host 0.0.0.0 --port "$FRONTEND_PORT" 2>&1 \
+    | tee -a "$ROOT/logs/frontend.log" \
     | prefix_awk "$(printf "${GREEN}[frontend]${NC} ")"
 ) &
 PIDS+=("$!")

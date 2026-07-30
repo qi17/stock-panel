@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import { Settings2, RadioTower, Star } from 'lucide-react'
 import type { KlineRow, FinancialMetricRecord } from '@/lib/api'
-import { fmtPrice, fmtBigNum, fmtVolume } from '@/lib/format'
+import { fmtPrice, fmtBigNum, fmtVolume, priceColorClass, getExtNumColorClass } from '@/lib/format'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { INFO_GROUPS, type ColumnConfig } from '@/lib/stock-info-fields'
 
@@ -40,8 +40,10 @@ function renderExtInline(
     return <span className="text-muted">—</span>
   }
   if (typeof val === 'number') {
-    const displayVal = Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val)
-    return <span className="tabular-nums">{displayVal}</span>
+    const displayVal = Math.abs(val) >= 10000 ? fmtBigNum(val) : (Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val))
+    const fieldName = col.source.type === 'ext' ? col.source.fieldName : ''
+    const colorCls = getExtNumColorClass(val, fieldName, col.label)
+    return <span className={`tabular-nums ${colorCls}`}>{displayVal}</span>
   }
   if (typeof val === 'boolean') {
     return <span className={val ? 'text-bull' : 'text-muted'}>{val ? '是' : '否'}</span>

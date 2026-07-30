@@ -130,6 +130,8 @@ def _index_quotes(repo, quote_service, as_of: date | None = None) -> list[dict]:
             change_pct = None
             lp = _finite(last_price)
             pc = _finite(prev_close)
+            if dt and as_of and dt < as_of:
+                pc = lp
             if lp is not None and pc not in (None, 0):
                 change_amount = lp - pc
                 change_pct = change_amount / pc * 100
