@@ -92,17 +92,25 @@ class GenericHTTPProvider:
         try:
             kline_dir = settings.data_dir / "kline_daily"
             if kline_dir.exists():
-                df_all = pl.scan_parquet(
+                # 增量同步（有 start_time）：只取 start_time 前 7 天起的收盘价，减少请求体积
+                # 全量同步（start_time=None）：取全部本地数据
+                import datetime as _dt
+                lf = pl.scan_parquet(
                     str(kline_dir / "**" / "*.parquet"),
                     extra_columns="ignore",
-                ).select(["symbol", "date", "close"]).collect()
+                ).select(["symbol", "date", "close"])
+                if start_time is not None:
+                    cutoff = (start_time - _dt.timedelta(days=7)).date()
+                    lf = lf.filter(pl.col("date") >= cutoff)
+                df_all = lf.collect()
                 for row in df_all.iter_rows(named=True):
                     sym = row["symbol"]
                     d = str(row["date"])[:10]
                     if sym not in local_closes:
                         local_closes[sym] = {}
                     local_closes[sym][d] = float(row["close"])
-                logger.info("get_adj_factors: 本地 kline_daily 已加载 %d 只股票收盘价", len(local_closes))
+                logger.info("get_adj_factors: 本地 kline_daily 已加载 %d 只股票收盘价 (cutoff=%s)",
+                            len(local_closes), str(start_time)[:10] if start_time else "全量")
         except Exception as e:
             logger.warning("get_adj_factors: 本地 kline_daily 读取失败，回退至 TDX K 线查询: %s", e)
 
@@ -111,6 +119,13 @@ class GenericHTTPProvider:
             # 构建该批次的 kline_closes 子集
             chunk_closes = {sym: local_closes[sym] for sym in chunk if sym in local_closes}
             override_body = {"kline_closes": chunk_closes} if chunk_closes else None
+            logger.info(
+                "adj_factor 批次 %d/%d | 股票数=%d | 时间范围=[%s ~ %s] | 本地收盘价命中=%d/%d",
+                i + 1, len(chunks), len(chunk),
+                str(start_time)[:10] if start_time else "-",
+                str(end_time)[:10] if end_time else "-",
+                len(chunk_closes), len(chunk),
+            )
             rows = self._request_rows(cfg, symbols=chunk, start_time=start_time, end_time=end_time,
                                       override_body=override_body)
             df = self._mapped_frame(cfg, rows)
