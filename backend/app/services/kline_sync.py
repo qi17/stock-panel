@@ -289,7 +289,10 @@ def sync_and_persist_daily_batch(
                 symbols, count=count, batch_size=batch_size, rpm=rpm,
                 start_time=start_time, end_time=end_time,
                 on_chunk_done=on_chunk_done,
+                failed_out=failed_syms,
             )
+            if not df.is_empty() and "symbol" in df.columns:
+                seen.update(df["symbol"].cast(pl.Utf8).unique().to_list())
             if not df.is_empty():
                 repo.append_daily(df)
                 try:
@@ -300,7 +303,9 @@ def sync_and_persist_daily_batch(
                     )
                 except Exception as e:  # noqa: BLE001
                     logger.warning("refresh view failed: %s", e)
-                return df.height
+                return _finalize(df.height)
+            else:
+                return _finalize(0)
         except Exception as e:
             logger.warning("TickFlow 日K全量同步失败: %s，将自动降级尝试使用自定义源...", e)
 
@@ -308,7 +313,7 @@ def sync_and_persist_daily_batch(
         if provider_name != "tickflow":
             current_provider = provider_name
         else:
-            return 0
+            return _finalize(0)
 
     if current_provider != "tickflow":
         from app.data_providers import custom as custom_sources
@@ -433,7 +438,6 @@ def _sweep_stale_daily_staging(staging_base, max_age_s: int = 24 * 60 * 60) -> N
                 shutil.rmtree(run_dir)
         except OSError:
             logger.warning("failed to clean stale daily staging: %s", run_dir)
->>>>>>> upstream/main
 
 
 def sync_daily_by_quotes(repo: KlineRepository) -> int:

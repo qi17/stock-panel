@@ -394,9 +394,10 @@ def get_daily(
             need_sync = True
         else:
             symbol_latest_date = df["date"].max()
-            _, global_latest_date = repo.get_enriched_latest()
-            if global_latest_date and symbol_latest_date < global_latest_date:
-                need_sync = True
+            if hasattr(repo, "get_enriched_latest"):
+                _, global_latest_date = repo.get_enriched_latest()
+                if global_latest_date and symbol_latest_date < global_latest_date:
+                    need_sync = True
 
     if need_sync:
         try:
