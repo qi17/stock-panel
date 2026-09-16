@@ -25,6 +25,7 @@ from pathlib import Path
 import duckdb
 import polars as pl
 
+from app.config import settings
 from app.enriched_generation import (
     EnrichedGenerationUnavailableError,
     EnrichedPublication,
