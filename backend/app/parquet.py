@@ -35,6 +35,17 @@ ENRICHED_STORAGE_SCHEMA: dict[str, pl.DataType] = {
     "quote_ts": pl.Int64,
 }
 
+MINUTE_STORAGE_SCHEMA: dict[str, pl.DataType] = {
+    "symbol": pl.Utf8,
+    "datetime": pl.Datetime("us"),
+    "open": pl.Float64,
+    "high": pl.Float64,
+    "low": pl.Float64,
+    "close": pl.Float64,
+    "volume": pl.Float64,
+    "amount": pl.Float64,
+}
+
 
 def scan_parquet_compat(source: Any, **kwargs: Any) -> pl.LazyFrame:
     """Scan partitioned parquet while tolerating additive schema changes."""
@@ -53,3 +64,10 @@ def scan_enriched_parquet(source: Any, **kwargs: Any) -> pl.LazyFrame:
     kwargs.setdefault("schema", ENRICHED_STORAGE_SCHEMA)
     kwargs.setdefault("cast_options", pl.ScanCastOptions(integer_cast="allow-float"))
     return scan_parquet_compat(source, **kwargs)
+
+
+def scan_minute_parquet(source: Any, **kwargs: Any) -> pl.LazyFrame:
+    kwargs.setdefault("schema", MINUTE_STORAGE_SCHEMA)
+    kwargs.setdefault("cast_options", pl.ScanCastOptions(integer_cast="allow-float"))
+    return scan_parquet_compat(source, **kwargs)
+

@@ -2,7 +2,7 @@ from datetime import date
 
 import polars as pl
 
-from app.parquet import scan_daily_parquet, scan_enriched_parquet
+from app.parquet import scan_daily_parquet, scan_enriched_parquet, scan_minute_parquet
 
 
 def test_partitioned_daily_scan_tolerates_added_quote_ts(tmp_path):
@@ -79,3 +79,12 @@ def test_partitioned_enriched_scan_tolerates_added_quote_ts(tmp_path):
     assert df.schema["volume"] == pl.Float64
     assert df.schema["quote_ts"] == pl.Int64
     assert df["quote_ts"].to_list() == [None, 1783560600000]
+
+
+def test_minute_scan_empty_glob_returns_empty_dataframe(tmp_path):
+    empty_glob = str(tmp_path / "non_existent_minute" / "**" / "*.parquet")
+    df = scan_minute_parquet(empty_glob).collect()
+    assert df.is_empty()
+    assert "datetime" in df.schema
+    assert df.schema["symbol"] == pl.Utf8
+

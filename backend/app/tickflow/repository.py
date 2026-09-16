@@ -24,7 +24,7 @@ import duckdb
 import polars as pl
 
 from app.config import settings
-from app.parquet import scan_enriched_parquet
+from app.parquet import scan_enriched_parquet, scan_minute_parquet
 
 logger = logging.getLogger(__name__)
 
@@ -1245,7 +1245,7 @@ class KlineRepository:
     ) -> pl.DataFrame:
         """分钟K查询 — Polars scan_parquet + predicate pushdown。"""
         try:
-            return pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
+            return scan_minute_parquet(self._minute_glob_for(asset_type)).filter(
                 (pl.col("symbol") == symbol)
                 & (pl.col("datetime").dt.date() == trade_date)
             ).sort("datetime").collect()
@@ -1267,7 +1267,7 @@ class KlineRepository:
         if not symbols:
             return pl.DataFrame()
         try:
-            return pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
+            return scan_minute_parquet(self._minute_glob_for(asset_type)).filter(
                 pl.col("symbol").is_in(symbols)
                 & (pl.col("datetime").dt.date() == trade_date)
             ).sort(["symbol", "datetime"]).collect()
@@ -1290,7 +1290,7 @@ class KlineRepository:
         if not symbols:
             return pl.DataFrame()
         try:
-            lf = pl.scan_parquet(self._minute_glob_for(asset_type))
+            lf = scan_minute_parquet(self._minute_glob_for(asset_type))
             available = set(lf.collect_schema().names())
             select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
             return (
@@ -1335,7 +1335,7 @@ class KlineRepository:
         if not parts:
             return pl.DataFrame()
         try:
-            lf = pl.scan_parquet(parts)
+            lf = scan_minute_parquet(parts)
             available = set(lf.collect_schema().names())
             select_cols = [c for c in ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"] if c in available]
             return (

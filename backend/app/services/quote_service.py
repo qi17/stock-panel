@@ -622,6 +622,9 @@ class QuoteService:
             ext = q.get("ext") or {}
             last_price = q.get("last_price")
             prev_close = q.get("prev_close")
+            # 竞价时段 TDX 返回 last_price=0（尚无成交价），用昨收兜底，避免算出 -100%
+            if not last_price and prev_close:
+                last_price = prev_close
             change_amount = ext.get("change_amount")
             change_pct = ext.get("change_pct")
             if change_amount is None and last_price is not None and prev_close is not None:
@@ -787,6 +790,9 @@ class QuoteService:
             ext = q.get("ext") or {}
             last_price = q.get("last_price")
             prev_close = q.get("prev_close")
+            # 竞价时段 TDX 返回 last_price=0（尚无成交价），用昨收兜底，避免算出 -100%
+            if not last_price and prev_close:
+                last_price = prev_close
             change_amount = q.get("change_amount") or ext.get("change_amount")
             change_pct = q.get("change_pct") or ext.get("change_pct")
             if change_amount is None and last_price is not None and prev_close is not None:

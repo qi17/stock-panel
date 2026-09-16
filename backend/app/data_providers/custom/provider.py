@@ -126,12 +126,15 @@ class GenericHTTPProvider:
                 str(end_time)[:10] if end_time else "-",
                 len(chunk_closes), len(chunk),
             )
-            rows = self._request_rows(cfg, symbols=chunk, start_time=start_time, end_time=end_time,
-                                      override_body=override_body)
-            df = self._mapped_frame(cfg, rows)
-            df = normalize_adj_factors(df, source=self.name)
-            if not df.is_empty():
-                frames.append(df)
+            try:
+                rows = self._request_rows(cfg, symbols=chunk, start_time=start_time, end_time=end_time,
+                                          override_body=override_body)
+                df = self._mapped_frame(cfg, rows)
+                df = normalize_adj_factors(df, source=self.name)
+                if not df.is_empty():
+                    frames.append(df)
+            except Exception as e:
+                logger.warning("adj_factor 批次 %d/%d 获取失败: %s", i + 1, len(chunks), e)
             if on_chunk_done:
                 on_chunk_done(i + 1, len(chunks))
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
