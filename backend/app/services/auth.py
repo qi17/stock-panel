@@ -22,6 +22,8 @@ import threading
 import time
 from pathlib import Path
 
+from app.services.fs_utils import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 # PBKDF2 参数(NIST 推荐, 单次校验 ~100ms, 兼顾安全与响应)
@@ -60,11 +62,9 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     p = _path()
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except OSError:
-        pass
+    atomic_write_text(
+        p, json.dumps(data, indent=2, ensure_ascii=False), mode=0o600,
+    )
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
@@ -131,9 +131,17 @@ def bootstrap_from_env() -> bool:
     Returns:
         True 表示本次用环境变量初始化了密码; False 表示无需初始化。
     """
-    from app.config import settings
+    from app.config import _ENV_FILE, settings
 
     pwd = (settings.auth_password or "").strip()
+    # Compose 会对 env_file 中未加单引号的 $VAR 做插值。Docker 部署时同时
+    # 只读挂载原始 .env,首次初始化密码直接按 dotenv 语义读取,避免特殊字符被截断。
+    if _ENV_FILE.is_file():
+        from dotenv import dotenv_values
+
+        raw_pwd = dotenv_values(_ENV_FILE, encoding="utf-8", interpolate=False).get("AUTH_PASSWORD")
+        if isinstance(raw_pwd, str) and raw_pwd.strip():
+            pwd = raw_pwd.strip()
     if not pwd:
         return False
     if is_configured():

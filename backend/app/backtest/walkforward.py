@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -136,6 +137,7 @@ class WalkForwardConfig:
     base_params: dict = field(default_factory=dict)
     overrides: dict | None = None
     backtest_kwargs: dict = field(default_factory=dict)
+    matrix_cache_max_mb: int = 512
 
 
 class WalkForwardService:
@@ -145,6 +147,47 @@ class WalkForwardService:
         self.optimizer = optimizer
         self.service = service
         self.strategy_engine = strategy_engine
+
+    def _prepare_shared_matrix(self, cfg: WalkForwardConfig, folds: list[Fold]):
+        """Build one immutable superset matrix for every matrix-native fold.
+
+        返回 None 时 run() 走通用路径: 每折独立优化 + OOS 回测, 正确但无共享矩阵加速。
+        python_history_legacy (filter_history) 与 polars_expr (内置) 策略无法装入
+        共享矩阵, 走通用路径; composite / minute_filter 仍不支持, 保持 fail-closed。
+        """
+        if self.strategy_engine is None or not folds:
+            return None
+        strategy = self.strategy_engine.get(cfg.strategy_id)
+        if strategy.execution_backend != "matrix_native":
+            if strategy.execution_backend in ("python_history_legacy", "polars_expr"):
+                return None
+            raise ValueError(
+                f"步进优化暂仅支持矩阵(matrix_native)/日线历史(python_history_legacy/"
+                f"polars_expr)策略; {cfg.strategy_id} 是 {strategy.execution_backend}"
+            )
+
+        from app.backtest.optimizer import expand_param_grid
+        from app.backtest.strategy import StrategyBacktestConfig
+
+        combos = expand_param_grid(strategy.meta.get("params", []), cfg.param_grid)
+        shared_start = min(fold.train_start for fold in folds)
+        shared_end = max(fold.test_end for fold in folds)
+        configs = [
+            StrategyBacktestConfig(
+                strategy_id=cfg.strategy_id,
+                symbols=cfg.symbols,
+                start=shared_start,
+                end=shared_end,
+                params={**cfg.base_params, **combo},
+                overrides=cfg.overrides,
+                **cfg.backtest_kwargs,
+            )
+            for combo in combos
+        ]
+        return self.service.prepare_matrix_optimization(
+            configs,
+            matrix_cache_max_bytes=int(cfg.matrix_cache_max_mb) * 1024 * 1024,
+        )
 
     def run(
         self,
@@ -159,6 +202,20 @@ class WalkForwardService:
         direction = cfg.direction or default_direction(cfg.objective)
         folds = generate_folds(cfg.start, cfg.end, cfg.train_days, cfg.test_days, cfg.step_days)
         n_total = len(folds)
+
+        shared_prepared = self._prepare_shared_matrix(cfg, folds)
+        shared_market_data = (
+            shared_prepared.market_data if shared_prepared is not None else None
+        )
+        shared_date_labels = (
+            tuple(label[:10] for label in shared_market_data.timestamp_labels)
+            if shared_market_data is not None
+            else ()
+        )
+
+        def _shared_window_has_data(window_start: date, window_end: date) -> bool:
+            index = bisect_left(shared_date_labels, window_start.isoformat())
+            return index < len(shared_date_labels) and shared_date_labels[index] <= window_end.isoformat()
 
         # 遥测: 首尾快照 PanelCache, 量化跨折重叠区间重复扫盘的 IO 占比 (是否值得进一步优化)。
         cache_before = self.service.engine.cache_stats()
@@ -176,6 +233,26 @@ class WalkForwardService:
             if cancel_event is not None and cancel_event.is_set():
                 break
 
+            base = {
+                "index": f.index,
+                "train_start": str(f.train_start),
+                "train_end": str(f.train_end),
+                "test_start": str(f.test_start),
+                "test_end": str(f.test_end),
+            }
+            missing_window = None
+            if shared_market_data is not None:
+                if not _shared_window_has_data(f.train_start, f.train_end):
+                    missing_window = "训练区间无可用行情数据"
+                elif not _shared_window_has_data(f.test_start, f.test_end):
+                    missing_window = "测试区间无可用行情数据"
+            if missing_window is not None:
+                skipped.append({**base, "reason": missing_window})
+                done += 1
+                if progress_cb is not None:
+                    progress_cb({"type": "walkforward_progress", "done": done, "total": n_total, "fold": f.index})
+                continue
+
             # 训练区间: 网格优化选最优参数
             opt_cfg = OptimizeConfig(
                 strategy_id=cfg.strategy_id,
@@ -190,18 +267,17 @@ class WalkForwardService:
                 overrides=cfg.overrides,
                 backtest_kwargs=is_backtest_kwargs,  # IS 强制 position, 堵前视泄漏
             )
-            opt_res = self.optimizer.optimize(opt_cfg, cancel_event=cancel_event)
+            if shared_market_data is None:
+                opt_res = self.optimizer.optimize(opt_cfg, cancel_event=cancel_event)
+            else:
+                opt_res = self.optimizer.optimize(
+                    opt_cfg,
+                    cancel_event=cancel_event,
+                    prepared_market_data=shared_market_data,
+                )
             best_params = opt_res.get("best_params")
             is_score = opt_res.get("best_score")
             done += 1
-
-            base = {
-                "index": f.index,
-                "train_start": str(f.train_start),
-                "train_end": str(f.train_end),
-                "test_start": str(f.test_start),
-                "test_end": str(f.test_end),
-            }
 
             # 训练区间没优化出参数 (全组失败/取消) -> 跳过, 不用默认参数硬跑 OOS 伪装成有效折
             if best_params is None:
@@ -221,7 +297,28 @@ class WalkForwardService:
                 overrides=cfg.overrides,
                 **cfg.backtest_kwargs,
             )
-            oos_res = self.service.run(oos_cfg, cancel_event=cancel_event)
+            oos_prepared = None
+            try:
+                if shared_market_data is not None:
+                    oos_prepared = self.service.prepare_matrix_optimization(
+                        [oos_cfg],
+                        matrix_cache_max_bytes=int(cfg.matrix_cache_max_mb) * 1024 * 1024,
+                        market_data_override=shared_market_data,
+                    )
+                if oos_prepared is None:
+                    oos_res = self.service.run(
+                        oos_cfg,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    oos_res = self.service.run(
+                        oos_cfg,
+                        cancel_event=cancel_event,
+                        prepared=oos_prepared,
+                    )
+            finally:
+                if oos_prepared is not None:
+                    oos_prepared.compute_cache.close()
 
             # OOS 失败 (含 cancelled) -> 跳过, 不把空/0 收益混入复利曲线
             if oos_res.error:
@@ -249,6 +346,15 @@ class WalkForwardService:
                 progress_cb({"type": "walkforward_progress", "done": done, "total": n_total, "fold": f.index})
 
         summary = aggregate_oos(valid_records, cfg.objective, direction)
+
+        shared_matrix_bytes = (
+            shared_prepared.market_data.nbytes if shared_prepared is not None else 0
+        )
+        shared_matrix_status = (
+            shared_prepared.market_data.cache_status if shared_prepared is not None else "none"
+        )
+        if shared_prepared is not None:
+            shared_prepared.compute_cache.close()
 
         # 遥测收尾: 本次 WF 累计扫盘耗时 / 命中 / 复用, 与总耗时对比得出 load_panel 占比。
         cache_after = self.service.engine.cache_stats()
@@ -278,5 +384,8 @@ class WalkForwardService:
             "skipped": skipped,
             "summary": summary,
             "cache_telemetry": cache_telemetry,
+            "shared_market_data": shared_prepared is not None,
+            "shared_market_data_bytes": shared_matrix_bytes,
+            "shared_market_data_status": shared_matrix_status,
             "elapsed_ms": elapsed_ms,
         }

@@ -1,6 +1,6 @@
-"""策略实时监控 — 订阅行情更新，检查策略买卖信号和提醒条件。
+"""策略实时监控 — 订阅行情更新，检查策略买卖信号。
 
-职责: 接收实时行情 DataFrame → 检查监控中策略的信号/提醒 → 推送告警。
+职责: 接收实时行情 DataFrame → 检查监控中策略的信号 → 推送告警。
 不知道: 策略加载逻辑、AI、API、配置持久化、回测。
 依赖: 外部调用 on_quote_update() 传入实时数据。
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -21,8 +22,11 @@ from typing import Any, Callable
 import polars as pl
 
 from app.market_time import cn_today
-from app.strategy.custom_signals import _OP_BUILDERS  # type: ignore  # 复用运算符构造器
 from app.strategy import config as _strategy_config
+from app.strategy.custom_signals import _OP_BUILDERS  # type: ignore  # 复用运算符构造器
+from app.strategy.custom_signals import signal_names as _custom_signal_names
+from app.strategy.intraday_signals import INTRADAY_SIGNAL_LABELS, uses_intraday_signals
+from app.strategy.monitor_rules import date_rule_in_window
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +44,12 @@ _SIGNAL_CN: dict[str, str] = {
     "signal_boll_breakdown_lower": "跌破布林下轨", "signal_volume_surge": "放量",
     "signal_limit_up": "涨停", "signal_limit_down": "跌停",
     "signal_limit_down_recovery": "跌停翘板", "signal_broken_limit_up": "炸板",
+    **INTRADAY_SIGNAL_LABELS,
     # 行情字段
     "close": "收盘价", "open": "开盘价", "high": "最高价", "low": "最低价",
     "change_pct": "涨跌幅", "change_amount": "涨跌额", "amplitude": "振幅",
-    "turnover_rate": "换手率", "volume": "成交量", "amount": "成交额",
+        "turnover_rate": "换手率", "volume": "成交量", "amount": "成交额",
+        "_volume_delta": "轮询成交量差值(手)", "_sealed_vol": "封单量(手)",
     # 均线
     "ma5": "MA5", "ma10": "MA10", "ma20": "MA20", "ma30": "MA30", "ma60": "MA60",
     "ema5": "EMA5", "ema10": "EMA10", "ema20": "EMA20",
@@ -67,10 +73,21 @@ def _signal_cn_name(name: str) -> str:
     return _SIGNAL_CN.get(name, name)
 
 
+def format_alert_quote(price, change_pct) -> str:
+    """告警正文尾部: '现价 1650.0 · +10.0%'。price/pct 均可缺; pct 为小数制。"""
+    parts = []
+    if price is not None:
+        parts.append(f"现价 {price}")
+    if change_pct is not None:
+        sign = "+" if change_pct >= 0 else ""
+        parts.append(f"{sign}{change_pct * 100:.1f}%")
+    return " · ".join(parts)
+
+
 @dataclass
 class StrategyAlert:
     """策略告警"""
-    type: str              # "entry" | "exit" | "alert"
+    type: str              # "entry" | "exit"
     strategy_id: str
     symbol: str
     name: str | None
@@ -102,7 +119,6 @@ class StrategyMonitorService:
         config: {
             "entry_signals": ["signal_n_day_high", ...],
             "exit_signals": ["signal_ma20_breakdown", ...],
-            "alerts": [{"field": "rsi_14", "op": ">", "value": 80, "message": "..."}],
         }
         """
         with self._watching_lock:
@@ -150,7 +166,7 @@ class StrategyMonitorService:
                         strategy_id=strategy_id,
                         symbol=sym,
                         name=name,
-                        message=f"入场信号触发",
+                        message="入场信号触发",
                         price=price,
                         change_pct=pct,
                         signals=hit_sigs,
@@ -167,25 +183,10 @@ class StrategyMonitorService:
                         strategy_id=strategy_id,
                         symbol=sym,
                         name=name,
-                        message=f"出场信号触发",
+                        message="出场信号触发",
                         price=price,
                         change_pct=pct,
                         signals=hit_sigs,
-                    )
-                    all_alerts.append(alert)
-                    self._emit(alert)
-
-            # 提醒条件
-            for alert_cfg in cfg.get("alerts", []):
-                for sym, name, price, pct in self._check_alert(df, alert_cfg):
-                    alert = StrategyAlert(
-                        type="alert",
-                        strategy_id=strategy_id,
-                        symbol=sym,
-                        name=name,
-                        message=alert_cfg.get("message", "提醒"),
-                        price=price,
-                        change_pct=pct,
                     )
                     all_alerts.append(alert)
                     self._emit(alert)
@@ -228,51 +229,63 @@ class StrategyMonitorService:
             results.append((sym, name, price, pct, hit_sigs))
         return results
 
-    @staticmethod
-    def _check_alert(
-        df: pl.DataFrame,
-        alert: dict,
-    ) -> list[tuple[str, str | None, float | None, float | None]]:
-        """检查阈值型提醒条件"""
-        field = alert.get("field", "")
-        if field not in df.columns:
-            return []
-
-        if "op" in alert:
-            # 阈值比较
-            op = alert["op"]
-            value = alert["value"]
-            col = pl.col(field)
-            ops = {
-                ">": col > value,
-                ">=": col >= value,
-                "<": col < value,
-                "<=": col <= value,
-            }
-            expr = ops.get(op)
-            if expr is None:
-                return []
-        else:
-            # 信号列 (布尔)
-            expr = pl.col(field).fill_null(False)
-
-        hit_df = df.filter(expr)
-        results = []
-        for row in hit_df.iter_rows(named=True):
-            results.append((
-                row.get("symbol", ""),
-                row.get("name"),
-                row.get("close"),
-                row.get("change_pct"),
-            ))
-        return results
-
-
 # ================================================================
 # 通用监控规则引擎 MonitorRuleEngine
 # ================================================================
 
 _SIGNAL_PREFIXES = ("signal_", "csg_")
+
+
+# ── 自选分组作用域: group_id → 成员集合解析 (进程内缓存) ────
+# 缓存按 watchlist 数据版本号失效: 版本不变时零磁盘 IO; 自选页任何增删
+# 分组/成员的操作都会 bump 版本号, 下一轮评估立即拿到新成员 (无需等 TTL)。
+_group_cache_lock = threading.Lock()
+_group_cache: dict[str, Any] = {}
+# 已告警过的「分组已删除」(rule_id, group_id), 防止每轮评估刷日志
+_warned_missing_groups: set[tuple[str, str]] = set()
+
+
+def _watchlist_groups_snapshot() -> dict[str, frozenset[str]]:
+    """返回 {group_id: 成员symbol集}。读前后版本一致才写缓存, 避免缓存住写竞态下的旧数据。"""
+    from app.services import watchlist
+
+    rev_before = watchlist.revision()
+    with _group_cache_lock:
+        cached = _group_cache.get("groups")
+        if cached is not None and _group_cache.get("_rev") == rev_before:
+            return cached
+    groups: dict[str, set[str]] = {g["id"]: set() for g in watchlist.list_groups()}
+    for row in watchlist.list_symbols():
+        for gid in row.get("group_ids") or []:
+            members = groups.get(gid)
+            if members is not None:
+                members.add(str(row["symbol"]))
+    frozen = {gid: frozenset(syms) for gid, syms in groups.items()}
+    if watchlist.revision() == rev_before:
+        with _group_cache_lock:
+            _group_cache["_rev"] = rev_before
+            _group_cache["groups"] = frozen
+    return frozen
+
+
+def _group_members_or_none(rule: dict) -> frozenset[str] | None:
+    """解析规则绑定的分组成员; 分组已删除返回 None, 解析异常返回 None 并记日志。"""
+    group_id = str(rule.get("group_id") or "")
+    try:
+        groups = _watchlist_groups_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("自选分组数据读取失败, 规则 %s 本轮跳过: %s", rule.get("id"), exc)
+        return None
+    members = groups.get(group_id)
+    if members is None:
+        key = (str(rule.get("id") or ""), group_id)
+        if key not in _warned_missing_groups:
+            _warned_missing_groups.add(key)
+            logger.warning(
+                "监控规则 %s 绑定的自选分组 %s 已删除, 本轮跳过 (fail-closed, 恢复分组后自动生效)",
+                rule.get("id"), group_id,
+            )
+    return members
 
 
 def _is_signal_field(field: str) -> bool:
@@ -315,19 +328,27 @@ class MonitorRuleEngine:
       - 规则来自 monitor_rules 存储 (用户可配), 而非写死的 strategy config
       - 支持 scope (symbols/all/sector) 过滤作用域
       - 支持 conditions + logic (AND/OR) 任意组合
-      - ★ cooldown 去重: 同一 (rule_id, symbol) 在冷却期内不重复触发
+      - ★ cooldown 去重: 同一 (rule_id, symbol, event_type) 在冷却期内不重复触发
     """
 
     def __init__(self, alert_handler: Callable[[dict], None] | None = None):
         self._alert_handler = alert_handler
         self._rules: dict[str, dict] = {}  # rule_id → rule
-        # (rule_id, symbol) → 上次触发时间戳(秒)。用于 cooldown 去重。
-        self._last_fire: dict[tuple[str, str], float] = {}
+        # (rule_id, symbol, event_type) → 上次触发时间戳(秒)。用于 cooldown 去重。
+        self._last_fire: dict[tuple[str, str, str], float] = {}
+        # date 规则每个交易日只在首个轮询评估一次; 规则集变更时失效重评
+        self._date_eval_day: str | None = None
+        self._date_eval_rules_version = -1
+        self._rules_version = 0  # set/add/remove/clear 递增, 供 date 缓存失效
         self._strategy_engine = None  # 延迟注入, type=strategy 规则用它跑选股
         # symbol → 股票名 (enriched DataFrame 已 drop name 列, 触发时从此映射回填)
         self._name_map: dict[str, str] = {}
-        # 策略选股池状态: strategy_id → 上期选股符号集合 (用于 diff 变更)
-        self._strategy_pools: dict[str, set[str]] = {}
+        # 策略选股池状态: (rule_id, strategy_id, asset_type) → 上期选股符号集合
+        self._strategy_pools: dict[tuple[str, str, str], set[str]] = {}
+        # 策略信号状态: (rule_id, strategy_id, asset_type, event_type) → (K线日期, 命中集合)
+        self._strategy_signal_state: dict[tuple[str, str, str, str], tuple[str, set[str]]] = {}
+        # 同一根 K 线的信号即使盘中回落后再次命中也只通知一次。
+        self._strategy_signal_seen: dict[tuple[str, str, str, str, str], str] = {}
         # 数据目录 (用于加载策略 overrides)
         self._data_dir = None
         # 历史窗口加载器: (target_date, lookback_days) → 多日 enriched DataFrame。
@@ -336,6 +357,7 @@ class MonitorRuleEngine:
         self._history_loader: Callable[[_dt.date, int], "pl.DataFrame"] | None = None
         # ETF 版历史窗口加载器 (asset_type=etf 的规则用)。为 None 时 ETF filter_history 策略跳过。
         self._history_loader_etf: Callable[[_dt.date, int], "pl.DataFrame"] | None = None
+        self._active_matrix_snapshots: dict[str, Any] = {}
         # 本轮 evaluate() 产出的策略选股结果: strategy_id → {rows, total, as_of}
         # 供策略页实时回显复用 (/api/screener/cached 端点直接读取, 避免重跑)。
         # 注意: 始终是「完整」的 dict —— evaluate 重算时先写到 _building_strategy_results,
@@ -346,6 +368,11 @@ class MonitorRuleEngine:
         self._building_strategy_results: dict[str, dict] = {}
         # 本轮成功写入股票策略实时结果的策略 ID, 供 QuoteService 在计算完成后精确通知策略页。
         self._latest_strategy_result_ids: set[str] = set()
+        self._sector_monitor_service = None
+        self._sector_condition_state: dict[tuple[str, str], bool] = {}
+        # abnormal 规则边缘触发状态: (rule_id, symbol) → 上一轮是否已达阈值。
+        # 只在 False → True 跳变时告警 (首轮观测不触发, 防止新建规则瞬间刷屏)。
+        self._abnormal_condition_state: dict[tuple[str, str], bool] = {}
 
     def set_strategy_engine(self, engine) -> None:
         """注入 StrategyEngine, type=strategy 规则据此跑选股。"""
@@ -354,6 +381,31 @@ class MonitorRuleEngine:
     def set_data_dir(self, data_dir) -> None:
         """注入数据目录, 用于加载策略的用户覆盖配置。"""
         self._data_dir = data_dir
+
+    def _signal_label(self, field: str) -> str:
+        """信号/字段 → 中文名: 内置查 _SIGNAL_CN; 自定义 csg_/csgi_ 查用户命名。
+
+        自定义信号命名从 data_dir 的 custom_signals 定义加载 (指纹缓存);
+        未注入 data_dir 或查不到时回退原始列名。
+        """
+        if field.startswith(("csg_", "csgi_")) and self._data_dir is not None:
+            name = _custom_signal_names(self._data_dir).get(field)
+            if name:
+                return name
+        return _signal_cn_name(field)
+
+    def set_sector_monitor_service(self, service) -> None:
+        self._sector_monitor_service = service
+
+    def invalidate_strategy_state(self) -> None:
+        """策略注册表变更后清除选股池、结果和矩阵快照。"""
+        self._strategy_pools.clear()
+        self._strategy_signal_state.clear()
+        self._strategy_signal_seen.clear()
+        self._latest_strategy_results = {}
+        self._building_strategy_results = {}
+        self._latest_strategy_result_ids.clear()
+        self._active_matrix_snapshots.clear()
 
     def set_history_loader(self, fn) -> None:
         """注入历史窗口加载器, 用于声明 filter_history 的策略跑实时监控。
@@ -387,6 +439,28 @@ class MonitorRuleEngine:
         self._name_map = name_map or {}
 
     # ── 规则管理 ───────────────────────────────────────
+    @staticmethod
+    def _rule_state_signature(rule: dict) -> tuple[Any, ...]:
+        return (
+            rule.get("type"),
+            rule.get("strategy_id"),
+            rule.get("score_min"),
+            rule.get("score_max"),
+            rule.get("asset_type", "stock"),
+            rule.get("scope", "symbols"),
+            tuple(sorted(str(symbol) for symbol in rule.get("symbols", []))),
+            rule.get("sector"),
+            rule.get("sector_kind"),
+            tuple(sorted(str(target.get("key")) for target in rule.get("sector_targets", []))),
+            rule.get("sector_trigger"),
+            rule.get("direction"),
+            rule.get("threshold_pct"),
+            rule.get("window_minutes"),
+            rule.get("abnormal_window"),
+            rule.get("remind_date"),
+            rule.get("lead_days"),
+        )
+
     def set_rules(self, rules: list[dict]) -> None:
         """批量设置规则 (覆盖)。用于启动时 reload。
 
@@ -397,23 +471,76 @@ class MonitorRuleEngine:
         for r in rules:
             if r.get("enabled") is not False:
                 new_rules[r["id"]] = r
+        changed_ids = {
+            rule_id
+            for rule_id, rule in new_rules.items()
+            if rule_id in self._rules
+            and self._rule_state_signature(self._rules[rule_id])
+            != self._rule_state_signature(rule)
+        }
         self._rules = new_rules
+        active_ids = set(new_rules) - changed_ids
+        self._last_fire = {
+            key: value for key, value in list(self._last_fire.items()) if key[0] in active_ids
+        }
+        self._strategy_pools = {
+            key: value for key, value in list(self._strategy_pools.items()) if key[0] in active_ids
+        }
+        self._strategy_signal_state = {
+            key: value
+            for key, value in list(self._strategy_signal_state.items())
+            if key[0] in active_ids
+        }
+        self._strategy_signal_seen = {
+            key: value
+            for key, value in list(self._strategy_signal_seen.items())
+            if key[0] in active_ids
+        }
+        self._sector_condition_state = {
+            key: value
+            for key, value in list(self._sector_condition_state.items())
+            if key[0] in active_ids
+        }
+        self._abnormal_condition_state = {
+            key: value
+            for key, value in list(self._abnormal_condition_state.items())
+            if key[0] in active_ids
+        }
         logger.info("MonitorRuleEngine: 装载 %d 条规则", len(self._rules))
+        self._rules_version += 1
 
     def add_rule(self, rule: dict) -> None:
         if rule.get("enabled") is not False:
             self._rules[rule["id"]] = rule
         else:
             self._rules.pop(rule["id"], None)
+        self._rules_version += 1
 
     def remove_rule(self, rule_id: str) -> None:
         self._rules.pop(rule_id, None)
-        # 清理对应的 cooldown 记录 (list 快照: 评估线程可能并发写 _last_fire)
         self._last_fire = {k: v for k, v in list(self._last_fire.items()) if k[0] != rule_id}
+        self._strategy_pools = {
+            k: v for k, v in list(self._strategy_pools.items()) if k[0] != rule_id
+        }
+        self._strategy_signal_state = {
+            k: v for k, v in list(self._strategy_signal_state.items()) if k[0] != rule_id
+        }
+        self._strategy_signal_seen = {
+            k: v for k, v in list(self._strategy_signal_seen.items()) if k[0] != rule_id
+        }
+        self._sector_condition_state = {
+            k: v for k, v in self._sector_condition_state.items() if k[0] != rule_id
+        }
+        self._rules_version += 1
 
     def clear(self) -> None:
         self._rules.clear()
         self._last_fire.clear()
+        self._strategy_pools.clear()
+        self._strategy_signal_state.clear()
+        self._strategy_signal_seen.clear()
+        self._sector_condition_state.clear()
+        self._rules_version += 1
 
     @property
     def rules(self) -> dict[str, dict]:
@@ -446,6 +573,19 @@ class MonitorRuleEngine:
             r.get("enabled", True) and r.get("type") == rtype
             for r in list(self._rules.values())
         )
+
+    def intraday_signal_symbols(self, asset_type: str) -> set[str]:
+        """返回启用的分时信号规则所需标的并集。"""
+        symbols: set[str] = set()
+        for rule in list(self._rules.values()):
+            if (
+                rule.get("enabled", True)
+                and rule.get("asset_type", "stock") == asset_type
+                and rule.get("scope") == "symbols"
+                and uses_intraday_signals(rule)
+            ):
+                symbols.update(str(symbol) for symbol in rule.get("symbols", []) if symbol)
+        return symbols
 
     # ── 评估 ───────────────────────────────────────────
     def has_asset_rules(self, asset_type: str) -> bool:
@@ -485,10 +625,88 @@ class MonitorRuleEngine:
             self._building_strategy_results = {}
             self._latest_strategy_result_ids.clear()
 
+        matrix_rules: list[dict] = []
+        params_map: dict[str, dict] = {}
+        overrides_map: dict[str, dict] = {}
+        if self._strategy_engine is not None:
+            for rule in list(self._rules.values()):
+                if (
+                    not rule.get("enabled", True)
+                    or rule.get("type") != "strategy"
+                    or rule.get("asset_type", "stock") != asset_type
+                ):
+                    continue
+                sid = rule.get("strategy_id")
+                if not sid:
+                    continue
+                try:
+                    strategy = self._strategy_engine.get(sid)
+                except Exception:
+                    continue
+                if getattr(strategy, "execution_backend", "polars_expr") != "matrix_native":
+                    continue
+                overrides = {}
+                if self._data_dir:
+                    overrides = _strategy_config.load_override(self._data_dir, sid)
+                matrix_rules.append(rule)
+                overrides_map[sid] = overrides
+                params_map[sid] = dict(overrides.get("params") or {})
+        if matrix_rules:
+            try:
+                history_loader = self._history_loader_for(matrix_rules[0])
+                if history_loader is None:
+                    raise ValueError("matrix strategy monitor requires history loader")
+                matrix_ids = [str(rule["strategy_id"]) for rule in matrix_rules]
+                history_bars = self._strategy_engine.required_history_bars(
+                    matrix_ids,
+                    params_map=params_map,
+                    overrides_map=overrides_map,
+                )
+                from app.strategy.engine import StrategyDataContext
+                context = StrategyDataContext(
+                    asset_type=asset_type,
+                    timeframe="1d",
+                    as_of=cn_today(),
+                    current=df,
+                    cache_key=f"monitor:{asset_type}",
+                )
+                try:
+                    snapshot = self._strategy_engine.prepare_realtime_matrix(
+                        context,
+                        matrix_ids,
+                        params_map=params_map,
+                        overrides_map=overrides_map,
+                    )
+                except ValueError as exc:
+                    if "requires history data" not in str(exc):
+                        raise
+                    history = history_loader(cn_today(), history_bars)
+                    snapshot = self._strategy_engine.prepare_realtime_matrix(
+                        StrategyDataContext(
+                            asset_type=asset_type,
+                            timeframe="1d",
+                            as_of=cn_today(),
+                            current=df,
+                            history=history,
+                            cache_key=f"monitor:{asset_type}",
+                        ),
+                        matrix_ids,
+                        params_map=params_map,
+                        overrides_map=overrides_map,
+                    )
+                self._active_matrix_snapshots[asset_type] = snapshot
+            except Exception as e:
+                self._active_matrix_snapshots.pop(asset_type, None)
+                logger.warning("%s 矩阵策略实时缓存准备失败: %s", asset_type, e)
+
         # list() 快照: 本方法跑在行情轮询线程, API 线程同时 add/remove 规则
         # 会触发 "dictionary changed size during iteration", 整轮告警丢失
         for rule_id, rule in list(self._rules.items()):
             if rule.get("asset_type", "stock") != asset_type:
+                continue
+            if rule.get("type") in ("sector", "abnormal", "date"):
+                # 三者不走行情 DataFrame 评估, 各走 evaluate_sectors / evaluate_abnormal /
+                # evaluate_date_rules 专用路径
                 continue
             try:
                 events.extend(self._evaluate_rule(df, rule, now))
@@ -498,8 +716,366 @@ class MonitorRuleEngine:
         # 一次性提交本轮结果 (原子替换): /cached 读方要么拿到上一轮完整结果,
         # 要么拿到本轮完整结果, 不会读到空中间态。
         self._latest_strategy_results = self._building_strategy_results
+        self._active_matrix_snapshots.pop(asset_type, None)
 
         return events
+
+    def evaluate_date_rules(self, now: float | None = None) -> list[dict]:
+        """纯日历评估 date 规则: 窗口命中 + 每天最多一次, 无行情条件。
+
+        由行情轮询在盘中调用 (quote_service._evaluate_monitors), 事件与 _evaluate_rule 同构。
+        窗口按自然日; 到期落在休市/节假日时需 lead_days 覆盖 (交易日历口径待 issue 定夺)。
+        每个交易日只在首个轮询完整评估一次, 其余轮次命中缓存直接跳过。
+        """
+        now = now if now is not None else time.time()
+        today_iso = cn_today().isoformat()
+        if self._date_eval_day == today_iso and self._date_eval_rules_version == self._rules_version:
+            return []
+        # 跨天首轮清掉已过期日期的按天 cooldown 键, 避免 _last_fire 无限累积
+        self._last_fire = {
+            key: value
+            for key, value in self._last_fire.items()
+            if not (key[1].startswith("_date_") and key[1] != f"_date_{today_iso}")
+        }
+
+        today_d = _dt.date.fromisoformat(today_iso)
+        events: list[dict] = []
+        for rule in list(self._rules.values()):
+            if rule.get("type") != "date" or rule.get("enabled") is False:
+                continue
+            remind = rule.get("remind_date") or ""
+            if not date_rule_in_window(remind, int(rule.get("lead_days", 0)), today_iso):
+                continue
+            # 按天隔离: 窗口内每天最多触发一次
+            key = (rule["id"], f"_date_{today_iso}", "date")
+            cooldown = int(rule.get("cooldown_seconds") or 86400)
+            last = self._last_fire.get(key)
+            if last is not None and (now - last) < cooldown:
+                continue
+            self._last_fire[key] = now
+
+            symbols = [s for s in rule.get("symbols", []) if s]
+            single_symbol = symbols[0] if len(symbols) == 1 else None
+            msg = rule.get("message") or f"日期提醒 · {today_iso}"
+            try:
+                remain = (_dt.date.fromisoformat(remind) - today_d).days
+            except ValueError:
+                remain = 0
+            msg += " · 今日到期" if remain <= 0 else f" · {remain}天后到期"
+            # 单标的由 ev.symbol 携带; 仅多标的时拼列表
+            if len(symbols) > 1:
+                shown = "、".join(symbols[:3]) + ("等" if len(symbols) > 3 else "")
+                msg = f"{msg} · {shown}"
+
+            ev = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "strategy_id": None,
+                "source": "date",
+                "type": "date_reminder",
+                "symbol": single_symbol or "",
+                "name": (self._name_map.get(single_symbol) or single_symbol) if single_symbol else None,
+                "message": msg,
+                "price": None,
+                "change_pct": None,
+                "signals": [],
+                "severity": rule.get("severity", "info"),
+                "conditions": [],
+                "logic": "and",
+            }
+            events.append(ev)
+            if self._alert_handler:
+                try:
+                    self._alert_handler(ev)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("alert handler failed: %s", e)
+        self._date_eval_day = today_iso
+        self._date_eval_rules_version = self._rules_version
+        return events
+
+    def evaluate_sectors(
+        self,
+        stock_df: pl.DataFrame,
+        index_df: pl.DataFrame,
+        *,
+        now: float | None = None,
+    ) -> list[dict]:
+        """按板块聚合快照评估 type=sector 规则。"""
+        if self._sector_monitor_service is None:
+            return []
+        rules = [
+            rule for rule in list(self._rules.values())
+            if rule.get("enabled", True) and rule.get("type") == "sector"
+        ]
+        if not rules:
+            return []
+
+        targets_by_key: dict[str, dict] = {}
+        windows: set[int] = set()
+        for rule in rules:
+            for target in rule.get("sector_targets", []):
+                if target.get("key"):
+                    targets_by_key[str(target["key"])] = target
+            if rule.get("sector_trigger") == "momentum":
+                windows.add(int(rule.get("window_minutes", 5)))
+
+        timestamp = time.time() if now is None else now
+        snapshots = self._sector_monitor_service.build_snapshots(
+            stock_df,
+            index_df,
+            list(targets_by_key.values()),
+            windows,
+            now=timestamp,
+        )
+        events: list[dict] = []
+        for rule in rules:
+            try:
+                events.extend(self._evaluate_sector_rule(rule, snapshots, timestamp))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("板块规则评估失败 %s: %s", rule.get("id"), exc)
+        return events
+
+    def _evaluate_sector_rule(self, rule: dict, snapshots: dict[str, dict], now: float) -> list[dict]:
+        events: list[dict] = []
+        direction = rule.get("direction", "up")
+        trigger = rule.get("sector_trigger", "change_pct")
+        threshold = float(rule.get("threshold_pct", 1.0)) / 100
+        window = int(rule.get("window_minutes", 5))
+
+        for target in rule.get("sector_targets", []):
+            target_key = str(target.get("key") or "")
+            snapshot = snapshots.get(target_key)
+            if not snapshot or not snapshot.get("valid"):
+                continue
+            value = (
+                snapshot.get("change_pct")
+                if trigger == "change_pct"
+                else snapshot.get("window_changes", {}).get(window)
+            )
+            condition = value is not None and (
+                value >= threshold if direction == "up" else value <= -threshold
+            )
+            state_key = (rule["id"], target_key)
+            previous = self._sector_condition_state.get(state_key)
+            self._sector_condition_state[state_key] = condition
+            if previous is None or previous or not condition:
+                continue
+
+            event_type = f"sector_{trigger}_{direction}"
+            cooldown_key = (rule["id"], target_key, event_type)
+            last = self._last_fire.get(cooldown_key)
+            cooldown = int(rule.get("cooldown_seconds", 3600))
+            if last is not None and now - last < cooldown:
+                continue
+            self._last_fire[cooldown_key] = now
+            message = rule.get("message", "") or self._sector_message(
+                snapshot, trigger, direction, threshold, window, value,
+            )
+            event = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "strategy_id": None,
+                "source": "sector",
+                "type": event_type,
+                "symbol": snapshot.get("symbol") if snapshot.get("kind") == "index" else "",
+                "name": snapshot.get("name"),
+                "message": message,
+                "price": snapshot.get("price"),
+                "change_pct": snapshot.get("change_pct"),
+                "window_change_pct": value if trigger == "momentum" else None,
+                "signals": [],
+                "severity": rule.get("severity", "info"),
+                "conditions": [],
+                "logic": "and",
+                "sector_kind": snapshot.get("kind"),
+                "sector_key": target_key,
+                "sector_name": snapshot.get("name"),
+                "sector_source_field": snapshot.get("source_field"),
+                "sector_value": snapshot.get("value"),
+                "sector_level": snapshot.get("level"),
+                "coverage_ratio": snapshot.get("coverage_ratio"),
+                "valid_count": snapshot.get("valid_count"),
+                "total_count": snapshot.get("total_count"),
+                "up_count": snapshot.get("up_count"),
+                "down_count": snapshot.get("down_count"),
+                "leader": snapshot.get("leader"),
+            }
+            events.append(event)
+            if self._alert_handler:
+                try:
+                    self._alert_handler(event)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("alert handler failed: %s", exc)
+        return events
+
+    @staticmethod
+    def _sector_message(
+        snapshot: dict,
+        trigger: str,
+        direction: str,
+        threshold: float,
+        window: int,
+        value: float | None,
+    ) -> str:
+        kind_label = {
+            "index": "指数", "concept": "概念", "industry": "行业",
+        }.get(snapshot.get("kind"), "板块")
+        current = float(snapshot.get("change_pct") or 0)
+        if trigger == "momentum":
+            action = "快速拉升" if direction == "up" else "快速下跌"
+            head = (
+                f"{kind_label}「{snapshot.get('name')}」{window}分钟{action} "
+                f"{float(value or 0) * 100:+.2f}%"
+            )
+        else:
+            action = "涨幅上穿" if direction == "up" else "跌幅下穿"
+            head = f"{kind_label}「{snapshot.get('name')}」{action} {threshold * 100:.2f}%"
+        parts = [head, f"当前 {current * 100:+.2f}%"]
+        if snapshot.get("kind") != "index":
+            parts.append(f"上涨 {snapshot.get('up_count', 0)}/{snapshot.get('valid_count', 0)}")
+            parts.append(f"覆盖 {float(snapshot.get('coverage_ratio') or 0) * 100:.0f}%")
+            leader = snapshot.get("leader") or {}
+            if leader.get("name") or leader.get("symbol"):
+                parts.append(
+                    f"领涨 {leader.get('name') or leader.get('symbol')} "
+                    f"{float(leader.get('change_pct') or 0) * 100:+.2f}%"
+                )
+        return "｜".join(parts)
+
+    def min_abnormal_closeness(self) -> float:
+        """启用的 abnormal 规则中最小的接近度阈值 (小数)。
+
+        供调用方 (quote_service) 构建异动快照时预过滤, 不必按最高阈值拉全量。
+        """
+        thresholds = [
+            float(r.get("threshold_pct", 70)) / 100
+            for r in list(self._rules.values())
+            if r.get("enabled", True) and r.get("type") == "abnormal"
+        ]
+        return min(thresholds) if thresholds else 1.0
+
+    def evaluate_abnormal(self, rows: list[dict], *, now: float | None = None) -> list[dict]:
+        """按异动边缘快照评估 type=abnormal 规则。
+
+        rows 为 abnormal_moves.build_overview 的 rows (调用方已按
+        min_abnormal_closeness 预过滤)。rows 为空也照常评估 —— 用于把
+        已消失标的的边缘状态清理回 False。
+        """
+        rules = [
+            rule for rule in list(self._rules.values())
+            if rule.get("enabled", True) and rule.get("type") == "abnormal"
+        ]
+        if not rules:
+            return []
+        timestamp = time.time() if now is None else now
+        events: list[dict] = []
+        for rule in rules:
+            try:
+                events.extend(self._evaluate_abnormal_rule(rule, rows, timestamp))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("异动规则评估失败 %s: %s", rule.get("id"), exc)
+        return events
+
+    def _evaluate_abnormal_rule(self, rule: dict, rows: list[dict], now: float) -> list[dict]:
+        events: list[dict] = []
+        threshold = float(rule.get("threshold_pct", 70)) / 100
+        if not 0 < threshold <= 1.5:
+            threshold = 0.7
+        direction = rule.get("direction", "both")
+        window_filter = str(rule.get("abnormal_window", "any"))
+        if rule.get("scope") == "symbols":
+            scope_symbols = {str(s) for s in rule.get("symbols", []) if s}
+        elif rule.get("scope") == "watchlist_group":
+            # 异动规则同样支持动态分组; 分组已删除返回 None → 本轮整体跳过
+            members = _group_members_or_none(rule)
+            if members is None:
+                return events
+            scope_symbols = set(members)
+        else:
+            scope_symbols = None
+
+        seen: set[str] = set()
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            if not symbol or (scope_symbols is not None and symbol not in scope_symbols):
+                continue
+            seen.add(symbol)
+            # 方向/窗口过滤后取接近度最高的窗口作为代表
+            best: tuple[str, float, float, float] | None = None  # (窗口, 接近度, 偏离值, 阈值)
+            for key, win in (row.get("windows") or {}).items():
+                if window_filter != "any" and key != window_filter:
+                    continue
+                value = win.get("value")
+                if value is None:
+                    continue
+                if direction == "up" and value <= 0:
+                    continue
+                if direction == "down" and value >= 0:
+                    continue
+                closeness = float(win.get("closeness") or 0)
+                if best is None or closeness > best[1]:
+                    best = (key, closeness, float(value), float(win.get("threshold") or 0))
+            condition = best is not None and best[1] >= threshold
+            state_key = (rule["id"], symbol)
+            previous = self._abnormal_condition_state.get(state_key)
+            self._abnormal_condition_state[state_key] = condition
+            if previous is None or previous or not condition:
+                continue
+
+            event_type = f"abnormal_{'up' if best[2] > 0 else 'down'}"
+            cooldown_key = (rule["id"], symbol, event_type)
+            last = self._last_fire.get(cooldown_key)
+            cooldown = int(rule.get("cooldown_seconds", 3600))
+            if last is not None and now - last < cooldown:
+                continue
+            self._last_fire[cooldown_key] = now
+            event = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "strategy_id": None,
+                "source": "abnormal",
+                "type": event_type,
+                "symbol": symbol,
+                "name": row.get("name"),
+                "message": rule.get("message", "") or self._abnormal_message(row, best),
+                "price": row.get("close"),
+                "change_pct": row.get("rt_pct"),
+                "signals": [],
+                "severity": rule.get("severity", "info"),
+                "conditions": [],
+                "logic": "and",
+                "abnormal_window": best[0],
+                "abnormal_value": round(best[2], 4),
+                "abnormal_threshold": best[3],
+                "abnormal_closeness": round(best[1], 4),
+            }
+            events.append(event)
+            if self._alert_handler:
+                try:
+                    self._alert_handler(event)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("alert handler failed: %s", exc)
+        # 本轮未出现的标的 (跌出预过滤区间) 状态置 False 而非删除:
+        # 删除会被当成「首轮观测」而不触发, 置 False 才能在回升穿过阈值时再次告警。
+        for key, value in list(self._abnormal_condition_state.items()):
+            if key[0] == rule["id"] and key[1] not in seen and value:
+                self._abnormal_condition_state[key] = False
+        return events
+
+    @staticmethod
+    def _abnormal_message(row: dict, best: tuple[str, float, float, float]) -> str:
+        window, closeness, value, threshold = best
+        board = row.get("board") or ""
+        tag = f"{board}{'·ST' if row.get('st') else ''}"
+        state = "已达异常波动阈值" if closeness >= 1 else "接近异常波动阈值"
+        return (
+            f"{row.get('name') or row.get('symbol')} {window}偏离值 "
+            f"{value * 100:+.2f}%/阈值{threshold * 100:.0f}% ({tag}) "
+            f"接近度{closeness * 100:.0f}%, {state}"
+        )
 
     def _evaluate_rule(self, df: pl.DataFrame, rule: dict, now: float) -> list[dict]:
         """评估单条规则,返回触发的 events。"""
@@ -514,11 +1090,14 @@ class MonitorRuleEngine:
 
         rtype = rule.get("type", "signal")
         if rtype == "strategy":
-            # 策略类型: 跑策略选股 → 对比上期选股池 → 产出 new_entry/dropped 事件
+            # 策略类型: 跑策略选股, 同时产出所选的信号和结果池变更事件
             hit_rows = self._match_strategy(scoped, rule)
         elif rtype == "ladder":
             # 连板梯队封单监控: 独立处理 (需带预警封单值, 走专属 message)
             return self._evaluate_ladder(scoped, rule, now)
+        elif rtype == "volume_delta":
+            # 轮询放量监控: 相邻两次全市场快照的成交量差值, 独立处理走专属 message
+            return self._evaluate_volume_delta(scoped, rule, now)
         else:
             # signal / price / market: 通用条件匹配
             for sym, name, price, pct, hit_sigs in self._match_conditions(scoped, rule):
@@ -534,12 +1113,10 @@ class MonitorRuleEngine:
 
         events: list[dict] = []
         for ev_type, sym, name, price, pct, hit_sigs in hit_rows:
-            # cooldown 键: 批量事件用特殊键, 单只事件用 (rule_id, symbol)
+            # cooldown 键包含事件类型, 同股不同策略事件互不压制。
             is_batch = sym == "_batch"
-            if is_batch:
-                key = (rule["id"], f"_{ev_type}_batch")
-            else:
-                key = (rule["id"], sym)
+            key_symbol = f"_{ev_type}_batch" if is_batch else sym
+            key = (rule["id"], key_symbol, ev_type)
             last = self._last_fire.get(key)
             if last is not None and (now - last) < cooldown:
                 continue  # 冷却期内, 跳过
@@ -555,12 +1132,14 @@ class MonitorRuleEngine:
                     rule, ev_type=ev_type, sym=sym, name=resolved_name,
                     pct=pct, price=price,
                     conditions=list(rule.get("conditions", [])) if rule.get("type") != "strategy" else None,
+                    signals=hit_sigs,
                 )
 
             ev = {
                 "ts": int(now * 1000),
                 "rule_id": rule["id"],
                 "rule_name": rule.get("name", ""),
+                "strategy_id": rule.get("strategy_id") if rtype == "strategy" else None,
                 "source": source,
                 "type": ev_type,
                 "symbol": "" if is_batch else sym,
@@ -595,6 +1174,13 @@ class MonitorRuleEngine:
             if not syms:
                 return df.head(0)
             return df.filter(pl.col("symbol").is_in(syms))
+        if scope == "watchlist_group":
+            # 动态绑定自选分组: 每轮评估按分组当前成员过滤 (带版本号缓存)。
+            # 分组已删除/暂时为空 → fail-closed 返回空, 绝不退化为全市场。
+            members = _group_members_or_none(rule)
+            if not members:
+                return df.head(0)
+            return df.filter(pl.col("symbol").is_in(list(members)))
         if scope == "sector":
             # sector 过滤需 df 含板块列 (后续接入 ext_data JOIN)。在 JOIN 落地前
             # fail-closed 返回空 —— 绝不退化为「全市场」误触发 (旧行为 return df 会让
@@ -608,11 +1194,11 @@ class MonitorRuleEngine:
     def _match_strategy(
         self, df: pl.DataFrame, rule: dict,
     ) -> list[tuple[str, str, Any, Any, Any, list[str]]]:
-        """策略类型评估: 跑策略选股 → 对比上期选股池 → 产出变更事件。
+        """策略类型评估: 一次执行同时产出交易信号和结果池变更事件。
 
         返回 [(event_type, symbol, name, price, pct, signals)]
-        event_type: "new_entry" (新入选) | "dropped" (已移出)
-        单只变更逐只返回; 同一策略 >5 只合并为一条批量事件 (symbol="_batch")
+        event_type: buy_signal | sell_signal | pool_entry | pool_exit
+        同类事件超过 5 只时合并为一条批量事件 (symbol="_batch")
         """
         if self._strategy_engine is None:
             return []
@@ -620,7 +1206,7 @@ class MonitorRuleEngine:
         if not sid:
             return []
         at = rule.get("asset_type", "stock")
-        pool_key = (sid, at)
+        pool_key = (str(rule.get("id", sid)), sid, at)
         try:
             s = self._strategy_engine.get(sid)
         except Exception:
@@ -640,11 +1226,41 @@ class MonitorRuleEngine:
         # 旧实现因"实时监控不支持 history loader"直接跳过 → 反包等策略盘中永不触发。
         # 现接入 history_loader, 拼历史窗口 + 今日实时行情, 经 precomputed_history 喂给引擎。
         # loader 为 None (未装配) 时退回跳过, 保持旧行为, 不破坏无历史场景。
-        run_kwargs: dict = {
-            "as_of": cn_today(),
-            "overrides": overrides,
-        }
-        if s.filter_history_fn:
+        from app.strategy.engine import StrategyDataContext
+        current_context = StrategyDataContext(
+            asset_type=at,
+            timeframe="1d",
+            as_of=cn_today(),
+            current=df,
+        )
+        if getattr(s, "execution_backend", "polars_expr") == "composite":
+            # 叠加策略首版不支持实时监控: 各子策略需独立预热实时矩阵, 热路径成本为 N 倍,
+            # 违反"实时热路径不得随历史数据量线性增长"约束。fail-closed 跳过本轮,
+            # /cached 端点回退到盘后 strategy_cache.json 的批量结果。
+            logger.debug("叠加策略 %s 暂不支持实时监控, 跳过", sid)
+            return []
+        if getattr(s, "execution_backend", "polars_expr") == "matrix_native":
+            matrix = self._active_matrix_snapshots.get(at)
+            if matrix is None:
+                logger.debug("策略 %s 缺少本轮实时矩阵快照, 跳过", sid)
+                return []
+            current_context = StrategyDataContext(
+                asset_type=at,
+                timeframe="1d",
+                as_of=cn_today(),
+                current=df,
+                market=matrix,
+            )
+        required_history_bars = 1
+        history_resolver = getattr(self._strategy_engine, "required_history_bars", None)
+        if callable(history_resolver):
+            required_history_bars = history_resolver(
+                [sid],
+                overrides_map={sid: overrides},
+            )
+        if getattr(s, "execution_backend", "polars_expr") not in {"composite", "matrix_native"} and (
+            s.filter_history_fn or required_history_bars > 1
+        ):
             history_loader = self._history_loader_for(rule)
             if history_loader is None:
                 logger.debug("策略 %s 需要历史数据但未注入 history_loader (asset_type=%s), 跳过实时监控",
@@ -652,7 +1268,7 @@ class MonitorRuleEngine:
                 return []
             try:
                 today = cn_today()
-                lookback = max(1, getattr(s, "lookback_days", 30))
+                lookback = max(1, getattr(s, "lookback_days", 1), required_history_bars)
                 hist_df = history_loader(today, lookback)
                 if hist_df is None or hist_df.is_empty():
                     logger.debug("策略 %s 历史数据为空, 跳过本轮实时监控", sid)
@@ -663,30 +1279,39 @@ class MonitorRuleEngine:
                 if "date" in hist_df.columns:
                     hist_df = hist_df.filter(pl.col("date") != today)
                 # 拼接历史窗口 + 今日实时行情 (filter_history 用 .over("symbol") 窗口, 多日天然可用)
-                run_kwargs["precomputed_history"] = pl.concat(
-                    [hist_df, df], how="diagonal_relaxed"
+                current_context = StrategyDataContext(
+                    asset_type=at,
+                    timeframe="1d",
+                    as_of=today,
+                    current=df,
+                    history=pl.concat(
+                        [hist_df, df], how="diagonal_relaxed"
+                    ),
                 )
             except Exception as e:
                 logger.warning("策略 %s 加载历史窗口失败, 跳过: %s", sid, e)
                 return []
-        else:
-            # 普通策略: 复用当前 enriched DataFrame 跳过数据加载
-            run_kwargs["precomputed"] = df
-
         try:
-            result = self._strategy_engine.run(sid, **run_kwargs)
+            result = self._strategy_engine.run(
+                sid,
+                current_context,
+                pool=(df["symbol"].cast(pl.Utf8).to_list()
+                      if getattr(s, "execution_backend", "polars_expr") == "matrix_native"
+                      else None),
+                overrides=overrides,
+                params=dict(overrides.get("params") or {}),
+            )
         except Exception as e:
             logger.warning("策略 %s 选股执行失败: %s", sid, e)
             return []
 
         # 记录本轮完整选股结果 (供策略页实时回显: /cached 端点直接读取, 不落盘)。
-        # 与下面的 diff 事件无关 — 无论是否产生 new_entry/dropped, 结果都该可用于回显。
+        # 与下面的事件无关, 无论是否产生通知结果都用于策略页实时回显。
         # 策略结果缓存仅用于股票策略页 /cached 回显; ETF 策略页走实时单跑, 不写入。
         # 写到 evaluate 提供的临时容器 (_building_strategy_results), 算完后整体替换,
         # 避免并发读到半填充状态。
         if at == "stock":
             try:
-                import math
                 self._building_strategy_results[sid] = {
                     "total": result.total,
                     "as_of": str(cn_today()),
@@ -700,76 +1325,136 @@ class MonitorRuleEngine:
             except Exception:  # noqa: BLE001
                 pass
 
-        current_pool: set[str] = {r["symbol"] for r in result.rows}
+        score_min = rule.get("score_min")
+        score_max = rule.get("score_max")
+        score_filter_enabled = score_min is not None or score_max is not None
+        eligible_symbols: set[str] = set()
+        if score_filter_enabled:
+            for row in result.rows:
+                symbol = str(row.get("symbol", ""))
+                score = row.get("score", result.scores.get(symbol))
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    continue
+                if not math.isfinite(score):
+                    continue
+                if score_min is not None and score < score_min:
+                    continue
+                if score_max is not None and score > score_max:
+                    continue
+                eligible_symbols.add(symbol)
+        else:
+            eligible_symbols = {str(row["symbol"]) for row in result.rows}
+
+        current_pool = eligible_symbols
         prev_pool = self._strategy_pools.get(pool_key)
-
-        # 首次运行: 仅记录当前选股池, 不产生事件
-        if prev_pool is None:
-            self._strategy_pools[pool_key] = current_pool
-            return []
-
-        new_entries = current_pool - prev_pool
-        dropped = prev_pool - current_pool
-
-        # 无变更
-        if not new_entries and not dropped:
-            return []
-
-        # 更新存储
         self._strategy_pools[pool_key] = current_pool
 
+        notify_events = set(rule.get("notify_events") or ("pool_entry", "pool_exit"))
         sname = s.meta.get("name", "") or s.meta.get("id", sid)
-
-        # 构建查找表 (新入选股票可在 result.rows 中找到; 移出股票需从 df 找)
         row_map: dict[str, dict] = {r["symbol"]: r for r in result.rows}
-        dropped_map: dict[str, dict] = {}
-        if dropped:
-            try:
-                _dd = df.filter(pl.col("symbol").is_in(list(dropped)))
-                for row in _dd.iter_rows(named=True):
-                    dropped_map[row["symbol"]] = row
-            except Exception:
-                pass
+        try:
+            for row in df.iter_rows(named=True):
+                row_map.setdefault(str(row.get("symbol", "")), row)
+        except Exception:
+            pass
+
+        entry_signal_hits = result.entry_signal_hits
+        if score_filter_enabled:
+            entry_signal_hits = [
+                hit for hit in entry_signal_hits
+                if str(hit.get("symbol", "")) in eligible_symbols
+            ]
+        changes: dict[str, set[str]] = {
+            "buy_signal": self._new_strategy_signals(
+                pool_key, "buy_signal", result.as_of, entry_signal_hits,
+            ),
+            "sell_signal": self._new_strategy_signals(
+                pool_key, "sell_signal", result.as_of, result.exit_signal_hits,
+            ),
+            "pool_entry": set() if prev_pool is None else current_pool - prev_pool,
+            "pool_exit": set() if prev_pool is None else prev_pool - current_pool,
+        }
 
         results: list[tuple[str, str, Any, Any, Any, list[str]]] = []
-
-        # ── 新入选 ──
-        new_list = sorted(new_entries)
-        if len(new_list) > 5:
-            names: list[str] = []
-            for sym in new_list:
-                row = row_map.get(sym, {})
-                name = row.get("name") or self._name_map.get(sym, sym)
-                names.append(str(name))
-            message = f"策略「{sname}」进入 {len(new_entries)} 只：{'、'.join(names)}"
-            results.append(("new_entry", "_batch", message, None, None, []))
-        else:
-            for sym in new_list:
-                row = row_map.get(sym, {})
-                name = row.get("name") or self._name_map.get(sym, sym)
-                price = row.get("close")
-                pct = row.get("change_pct")
-                results.append(("new_entry", sym, name, price, pct, []))
-
-        # ── 已移出 ──
-        dropped_list = sorted(dropped)
-        if len(dropped_list) > 5:
-            names = []
-            for sym in dropped_list:
-                row = dropped_map.get(sym, {})
-                name = row.get("name") or self._name_map.get(sym, sym)
-                names.append(str(name))
-            message = f"策略「{sname}」移出 {len(dropped)} 只：{'、'.join(names)}"
-            results.append(("dropped", "_batch", message, None, None, []))
-        else:
-            for sym in dropped_list:
-                row = dropped_map.get(sym, {})
-                name = row.get("name") or self._name_map.get(sym, sym)
-                price = row.get("close")
-                pct = row.get("change_pct")
-                results.append(("dropped", sym, name, price, pct, []))
+        signal_map = {
+            "buy_signal": {
+                str(hit["symbol"]): list(hit.get("signals") or [])
+                for hit in entry_signal_hits
+            },
+            "sell_signal": {
+                str(hit["symbol"]): list(hit.get("signals") or [])
+                for hit in result.exit_signal_hits
+            },
+        }
+        action_labels = {
+            "buy_signal": "买入信号",
+            "sell_signal": "卖出信号",
+            "pool_entry": "进入选股结果",
+            "pool_exit": "移出选股结果",
+        }
+        for event_type, symbols in changes.items():
+            if event_type not in notify_events or not symbols:
+                continue
+            symbol_list = sorted(symbols)
+            if len(symbol_list) > 5:
+                names = [
+                    str(row_map.get(symbol, {}).get("name") or self._name_map.get(symbol, symbol))
+                    for symbol in symbol_list
+                ]
+                message = (
+                    f"策略「{sname}」{action_labels[event_type]} {len(symbol_list)} 只: "
+                    f"{'、'.join(names)}"
+                )
+                hit_signals = sorted({
+                    signal
+                    for symbol in symbol_list
+                    for signal in signal_map.get(event_type, {}).get(symbol, [])
+                })
+                results.append((event_type, "_batch", message, None, None, hit_signals))
+                continue
+            for symbol in symbol_list:
+                row = row_map.get(symbol, {})
+                name = row.get("name") or self._name_map.get(symbol, symbol)
+                results.append((
+                    event_type,
+                    symbol,
+                    name,
+                    row.get("close"),
+                    row.get("change_pct"),
+                    signal_map.get(event_type, {}).get(symbol, []),
+                ))
 
         return results
+
+    def _new_strategy_signals(
+        self,
+        pool_key: tuple[str, str, str],
+        event_type: str,
+        as_of: Any,
+        hits: list[dict],
+    ) -> set[str]:
+        rule_id, strategy_id, asset_type = pool_key
+        state_key = (rule_id, strategy_id, asset_type, event_type)
+        date_key = str(as_of)
+        current = {str(hit["symbol"]) for hit in hits}
+        previous = self._strategy_signal_state.get(state_key)
+        self._strategy_signal_state[state_key] = (date_key, current)
+
+        if previous is None:
+            for symbol in current:
+                self._strategy_signal_seen[(*state_key, symbol)] = date_key
+            return set()
+
+        previous_date, previous_symbols = previous
+        candidates = current if previous_date != date_key else current - previous_symbols
+        fresh = {
+            symbol
+            for symbol in candidates
+            if self._strategy_signal_seen.get((*state_key, symbol)) != date_key
+        }
+        for symbol in fresh:
+            self._strategy_signal_seen[(*state_key, symbol)] = date_key
+        return fresh
 
     @staticmethod
     def _match_conditions(
@@ -794,6 +1479,140 @@ class MonitorRuleEngine:
             ]
             results.append((sym, name, price, pct, hit_sigs))
         return results
+
+    @staticmethod
+    def _volume_delta_basic_mask(df: pl.DataFrame, bf: dict, name_map: dict[str, str]) -> pl.Expr | None:
+        """轮询放量基础过滤掩码 (与策略 basic_filter 语义对齐, 字段缺失时该项跳过)。
+
+        支持: price_min/max (收盘价), market_cap_min (总市值=close x total_shares),
+        float_cap_min/max (流通市值), amount_min (当日累计成交额), exclude_st (名称含 ST)。
+        """
+        masks: list[pl.Expr] = []
+        if bf.get("price_min") is not None:
+            masks.append(pl.col("close") >= float(bf["price_min"]))
+        if bf.get("price_max") is not None:
+            masks.append(pl.col("close") <= float(bf["price_max"]))
+        if bf.get("amount_min") is not None and "amount" in df.columns:
+            masks.append(pl.col("amount") >= float(bf["amount_min"]))
+        if bf.get("market_cap_min") is not None and "total_shares" in df.columns:
+            masks.append((pl.col("close") * pl.col("total_shares")) >= float(bf["market_cap_min"]))
+        if bf.get("float_cap_min") is not None and "float_shares" in df.columns:
+            masks.append((pl.col("close") * pl.col("float_shares")) >= float(bf["float_cap_min"]))
+        if bf.get("float_cap_max") is not None and "float_shares" in df.columns:
+            masks.append((pl.col("close") * pl.col("float_shares")) <= float(bf["float_cap_max"]))
+        if bf.get("exclude_st") and name_map:
+            st_symbols = [
+                sym for sym, name in name_map.items()
+                if name and "ST" in str(name).upper()
+            ]
+            if st_symbols:
+                masks.append(~pl.col("symbol").is_in(st_symbols))
+        if not masks:
+            return None
+        return pl.all_horizontal(masks)
+
+    def _evaluate_volume_delta(self, scoped: pl.DataFrame, rule: dict, now: float) -> list[dict]:
+        """评估轮询放量监控: 相邻两次全市场快照的成交量/成交额差值。
+
+        差值列 _volume_delta(手)/_volume_delta_amount(元)/间隔列 _volume_delta_span
+        由 quote_service 评估前注入。metric=volume 按手数、amount 按金额比较阈值;
+        basic_filter 先行过滤 (股价/市值/成交额/ST, 与策略 basic_filter 语义对齐)。
+        命中 >5 只时合并为一条批量事件防刷屏。
+        """
+        if "_volume_delta" not in scoped.columns:
+            return []  # 无差值数据 (首轮/开盘保护/非全市场轮询), 安全降级
+
+        metric = rule.get("metric", "volume")
+        if metric == "amount" and "_volume_delta_amount" in scoped.columns:
+            cmp_col, threshold = "_volume_delta_amount", rule.get("threshold_amount", 1e6)
+            th_text = f"{threshold / 1e4:,.0f} 万元"
+        else:
+            cmp_col, threshold = "_volume_delta", rule.get("threshold_volume", 9000)
+            th_text = f"{threshold:,.0f} 手"
+
+        cooldown = rule.get("cooldown_seconds", 300)
+        severity = rule.get("severity", "warn")
+        span_s = 0.0
+        if "_volume_delta_span" in scoped.columns and scoped.height > 0:
+            v = scoped["_volume_delta_span"][0]
+            span_s = float(v) if v is not None else 0.0
+        span_text = f" (间隔 {span_s:.0f}s)" if span_s > 0 else ""
+
+        candidate = scoped
+        bf = rule.get("basic_filter") or {}
+        if bf:
+            mask = self._volume_delta_basic_mask(candidate, bf, self._name_map)
+            if mask is not None:
+                candidate = candidate.filter(mask)
+
+        hit = candidate.filter(
+            pl.col(cmp_col).is_not_null() & (pl.col(cmp_col) >= threshold)
+        ).sort(cmp_col, descending=True)
+        if hit.is_empty():
+            return []
+        hit_rows = list(hit.iter_rows(named=True))
+
+        def _name_of(row: dict) -> str:
+            sym = row.get("symbol", "")
+            return row.get("name") or self._name_map.get(sym) or sym
+
+        def _fmt(v) -> str:
+            if metric == "amount":
+                return f"{v / 1e4:,.0f} 万元"
+            return f"{v:,.0f} 手"
+
+        def _event(symbol: str, name: str, message: str, *, delta=None, price=None, pct=None) -> dict:
+            ev = {
+                "ts": int(now * 1000),
+                "rule_id": rule["id"],
+                "rule_name": rule.get("name", ""),
+                "source": "volume_delta",
+                "type": "轮询放量",
+                "symbol": symbol,
+                "name": name,
+                "message": message,
+                "price": price,
+                "change_pct": pct,
+                "signals": [],
+                "severity": severity,
+                "conditions": [],
+                "logic": "and",
+                "volume_delta": delta,
+                "volume_delta_span": round(span_s, 1),
+            }
+            if metric == "amount":
+                ev["volume_delta_amount"] = delta
+            return ev
+
+        if len(hit_rows) > 5:
+            top = "、".join(_name_of(r) for r in hit_rows[:8])
+            suffix = "等" if len(hit_rows) > 8 else ""
+            message = (
+                f"放量 · 单轮增量 >= {th_text}{span_text} · "
+                f"共 {len(hit_rows)} 只: {top}{suffix}"
+            )
+            key = (rule["id"], "_volume_delta_batch", "volume_delta")
+            last = self._last_fire.get(key)
+            if last is not None and (now - last) < cooldown:
+                return []
+            self._last_fire[key] = now
+            return [_event("", "", message)]
+
+        events: list[dict] = []
+        for row in hit_rows:
+            sym = row.get("symbol", "")
+            key = (rule["id"], sym, "volume_delta")
+            last = self._last_fire.get(key)
+            if last is not None and (now - last) < cooldown:
+                continue
+            self._last_fire[key] = now
+            delta = row.get(cmp_col)
+            message = f"放量 · 单轮增量 {_fmt(delta)} >= {th_text}{span_text}"
+            events.append(_event(
+                sym, _name_of(row), message,
+                delta=delta, price=row.get("close"), pct=row.get("change_pct"),
+            ))
+        return events
 
     def _evaluate_ladder(self, scoped: pl.DataFrame, rule: dict, now: float) -> list[dict]:
         """评估连板梯队封单监控规则。
@@ -832,7 +1651,7 @@ class MonitorRuleEngine:
         events: list[dict] = []
         for row in hit.iter_rows(named=True):
             sym = row.get("symbol", "")
-            key = (rule["id"], sym)
+            key = (rule["id"], sym, "ladder")
             last = self._last_fire.get(key)
             if last is not None and (now - last) < cooldown:
                 continue
@@ -876,11 +1695,12 @@ class MonitorRuleEngine:
 
     def _default_message(self, rule: dict, ev_type: str = "", sym: str = "",
                           name: str = "", pct: Any = None, price: Any = None,
-                          conditions: list[dict] | None = None) -> str:
+                          conditions: list[dict] | None = None,
+                          signals: list[str] | None = None) -> str:
         """生成默认 message。
 
         - strategy: 按变更方向生成 (进入/移出 + 涨跌幅)
-        - signal/price/market: 条件摘要 + 现价 + 涨跌幅 (避免笼统的「信号触发」)
+        - signal/price/market: 命中信号 (signals 非空时) 或条件摘要 + 现价 + 涨跌幅
         """
         rtype = rule.get("type", "signal")
         if rtype == "strategy":
@@ -897,51 +1717,68 @@ class MonitorRuleEngine:
                 rn = rule.get("name", "")
                 sname = rn.split(" · ", 1)[1] if " · " in rn else (rn or "策略")
 
-            if ev_type == "new_entry":
+            action = {
+                "buy_signal": "买入信号",
+                "sell_signal": "卖出信号",
+                "pool_entry": "进入选股结果",
+                "pool_exit": "移出选股结果",
+                "new_entry": "进入选股结果",
+                "dropped": "移出选股结果",
+            }.get(ev_type)
+            if action:
                 pct_text = ""
                 if pct is not None:
                     sign = "+" if pct >= 0 else ""
                     pct_text = f" {sign}{pct * 100:.1f}%"
-                return f"策略「{sname}」进入 {name}{pct_text}"
-            elif ev_type == "dropped":
-                pct_text = ""
-                if pct is not None:
-                    sign = "+" if pct >= 0 else ""
-                    pct_text = f" {sign}{pct * 100:.1f}%"
-                return f"策略「{sname}」移出 {name}{pct_text}"
-            return f"策略「{sname}」变更"
+                return f"策略「{sname}」{action} {name}{pct_text}"
+            return f"策略「{sname}」事件"
 
-        # signal / price / market: 条件摘要 + 现价 + 涨跌幅
+        # signal / price / market: 命中信号 + 现价 + 涨跌幅
+        # 有实际命中信号 (op=truth 且为真的子集) 时以命中信号开头 — 全量规则
+        # 条件仍保留在 event.conditions 供前端展示, message 不再复读 (OR 规则
+        # 条件多时全文复读会淹没真正触发的条件)。
+        tail = format_alert_quote(price, pct)
+        if signals:
+            hit_text = "命中 " + "、".join(self._signal_label(s) for s in signals)
+            # AND 规则: 比较条件同样全部满足, 补进 message 保持信息完整。
+            # OR 规则无法判定哪些比较条件为真 (hit_sigs 只收集 truth 信号), 不补。
+            if rule.get("logic", "and") == "and":
+                comp = [c for c in (conditions if conditions is not None else rule.get("conditions", []))
+                        if c.get("op") != "truth"]
+                if comp:
+                    comp_text = self._format_conditions_text(rule, comp, resolver=self._signal_label)
+                    if comp_text:
+                        hit_text = f"{hit_text} 且 {comp_text}"
+            return f"{hit_text} · {tail}" if tail else hit_text
+        # 无 truth 命中 (纯比较条件规则): 回退条件摘要
         # 条件摘要: 把 conditions (truth/比较) 拼成可读串, 如 "MA20金叉 且 量比>2"
-        cond_text = self._format_conditions_text(rule, conditions)
-        price_text = f"现价 {price}" if price is not None else ""
-        pct_text = ""
-        if pct is not None:
-            sign = "+" if pct >= 0 else ""
-            pct_text = f"{sign}{pct * 100:.1f}%"
-        tail = " · ".join(s for s in (price_text, pct_text) if s)
+        cond_text = self._format_conditions_text(rule, conditions, resolver=self._signal_label)
         if cond_text and tail:
             return f"{cond_text} · {tail}"
         return cond_text or tail or "监控触发"
 
     @staticmethod
-    def _format_conditions_text(rule: dict, conditions: list[dict] | None) -> str:
+    def _format_conditions_text(rule: dict, conditions: list[dict] | None,
+                                 resolver: Callable[[str], str] | None = None) -> str:
         """把 rule.conditions 拼成可读文本 (用于 message / 推送)。
 
         op=truth: 直接用信号中文名 (如 "MA20金叉")
         op=比较: 字段中文名 + 操作符 + 值 (如 "涨跌幅≥5")
         logic: and → "且", or → "或"
+        resolver: 自定义信号名解析器 (默认 _signal_cn_name); 引擎内传
+            self._signal_label 以解析 csg_/csgi_ 用户命名, 外部 (lots.py) 不传。
         """
         conds = conditions if conditions is not None else list(rule.get("conditions", []))
         if not conds:
             return ""
         logic_word = "且" if rule.get("logic", "and") == "and" else "或"
+        label_of = resolver or _signal_cn_name
         parts: list[str] = []
         for c in conds:
             field = c.get("field", "")
             op = c.get("op", "truth")
             value = c.get("value")
-            label = _signal_cn_name(field) or field
+            label = label_of(field) or field
             if op == "truth":
                 parts.append(label)
             else:

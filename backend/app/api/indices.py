@@ -1,7 +1,9 @@
-"""指数 API。"""
+"""指数 API (核心四只固定清单, 浏览/搜索全量指数已下线; 仅保留详情读数与同步)。"""
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -9,12 +11,19 @@ import polars as pl
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.indicators.pipeline import compute_enriched
-from app.services import index_sync, kline_sync
+from app.market_time import cn_today
+from app.services import index_sync, kline_sync, preferences, trading_day
 from app.tickflow.capabilities import Cap
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/index", tags=["index"])
+
+# 指数分钟结果进程内缓存: 吸收板块切换卡片/指数页轮询与重挂载的重复请求
+_INDEX_MINUTE_CACHE_TTL = 10.0
+_INDEX_MINUTE_CACHE_MAX = 32
+_index_minute_cache: dict[tuple[str, str, str], tuple[float, pl.DataFrame]] = {}
+_index_minute_cache_lock = threading.Lock()
 
 
 def _index_info(repo, symbol: str) -> dict:
@@ -26,47 +35,6 @@ def _index_info(repo, symbol: str) -> dict:
         return {}
     return hit.to_dicts()[0]
 
-
-@router.get("/list")
-def list_indices(request: Request):
-    """返回已缓存的 CN_Index 指数列表。"""
-    repo = request.app.state.repo
-    df = repo.get_index_instruments()
-    if df.is_empty():
-        return {"results": [], "count": 0}
-    cols = [c for c in ["symbol", "name", "code", "asset_type"] if c in df.columns]
-    rows = df.select(cols).sort("symbol").to_dicts()
-    return {"results": rows, "count": len(rows)}
-
-
-@router.get("/search")
-def search_indices(
-    request: Request,
-    q: str = Query("", min_length=0, max_length=50, description="搜索关键词"),
-    limit: int = Query(20, ge=1, le=100),
-):
-    """模糊搜索指数。"""
-    repo = request.app.state.repo
-    df = repo.get_index_instruments()
-    if df.is_empty():
-        return {"results": []}
-    if not q.strip():
-        rows = df.head(limit).to_dicts()
-        return {"results": rows}
-
-    keyword = q.strip().upper()
-    masks = []
-    if "code" in df.columns:
-        masks.append(pl.col("code").cast(pl.Utf8).str.contains(keyword, literal=True))
-    masks.append(pl.col("symbol").cast(pl.Utf8).str.to_uppercase().str.contains(keyword, literal=True))
-    if "name" in df.columns:
-        masks.append(pl.col("name").cast(pl.Utf8).str.contains(q.strip(), literal=True))
-
-    mask = masks[0]
-    for m in masks[1:]:
-        mask = mask | m
-    rows = df.filter(mask).head(limit).to_dicts()
-    return {"results": rows}
 
 
 @router.get("/daily")
@@ -107,13 +75,45 @@ def get_index_daily(
 def get_index_minute(
     request: Request,
     symbol: str = Query(..., description="指数代码, 如 000001.SH"),
-    trade_date: date | None = Query(None, alias="date", description="交易日期, 默认今天"),
+    trade_date: date | None = Query(None, alias="date", description="交易日期, 休市时默认最近本地指数交易日"),
 ):
-    """实时读取指数分钟 K。不写入股票分钟 parquet。"""
+    """实时读取指数分钟 K。不写入股票分钟 parquet。
+
+    历史深度由当前分钟源决定, 显式日期不会因空数据而替换。
+    未指定日期且确认休市时使用最近本地指数日 K 的日期。
+    结果带 10s 进程内缓存, 不同指数、日期和分钟源分别缓存。
+    """
     repo = request.app.state.repo
+    capset = request.app.state.capabilities
     info = _index_info(repo, symbol)
-    day = trade_date or date.today()
-    df = kline_sync.fetch_minute_single(symbol, day)
+    today = cn_today()
+    day = trade_date or today
+    if trade_date is None and trading_day.is_trading_day() is False:
+        daily = repo.get_index_daily(symbol, today - timedelta(days=366), today, columns=["date"])
+        if not daily.is_empty():
+            day = daily["date"].max() or today
+    if day > today:
+        return {
+            "symbol": symbol,
+            "name": info.get("name"),
+            "index_info": info,
+            "date": str(day),
+            "rows": [],
+            "source": "future",
+        }
+    cache_key = (symbol, day.isoformat(), preferences.get_minute_data_provider())
+    now = time.monotonic()
+    with _index_minute_cache_lock:
+        hit = _index_minute_cache.get(cache_key)
+    if hit is not None and now - hit[0] < _INDEX_MINUTE_CACHE_TTL:
+        df = hit[1]
+    else:
+        df = kline_sync.fetch_minute_single(symbol, day, asset_type="index", capset=capset)
+        with _index_minute_cache_lock:
+            _index_minute_cache[cache_key] = (time.monotonic(), df)
+            while len(_index_minute_cache) > _INDEX_MINUTE_CACHE_MAX:
+                oldest = min(_index_minute_cache, key=lambda k: _index_minute_cache[k][0])
+                del _index_minute_cache[oldest]
     return {
         "symbol": symbol,
         "name": info.get("name"),

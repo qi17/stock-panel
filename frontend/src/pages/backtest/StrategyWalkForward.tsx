@@ -70,7 +70,7 @@ function OosEquityChart({ curve }: { curve: { fold: number; date: string; value:
 
 export function StrategyWalkForward() {
   const task = useWalkForwardTask()
-  const { data: stratData } = useQuery({ queryKey: ['strategies'], queryFn: api.strategyList })
+  const { data: stratData } = useQuery({ queryKey: ['strategies'], queryFn: () => api.strategyList() })
   const strategies: StrategyDetail[] = stratData?.strategies ?? []
 
   // 切策略: 有任务在跑时先真正取消 (关 SSE + 后端 cancel + 清 localStorage), 不能静默丢
@@ -186,7 +186,7 @@ export function StrategyWalkForward() {
           </button>
         ) : (
           <button onClick={onRun} disabled={!canRun} className="inline-flex w-full items-center justify-center gap-1.5 rounded-btn bg-accent px-3 py-2 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed">
-            <Play className="h-3.5 w-3.5" /> 开始 Walk-forward
+            <Play className="h-3.5 w-3.5" /> 开始步进优化
           </button>
         )}
       </div>
@@ -210,7 +210,7 @@ export function StrategyWalkForward() {
 
         {!result && !task?.isPending && (
           <EmptyState
-            title="Walk-forward 优化"
+            title="步进优化"
             hint="每折在训练区间网格优化选最优参数，再在紧邻的测试区间做样本外(OOS)验证。样本内漂亮、样本外崩溃即过拟合。"
           />
         )}

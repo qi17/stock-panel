@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Modal } from '@/components/Modal'
 import { X, Sparkles, Save, Loader2, ChevronLeft, ChevronRight, AlertTriangle, Settings2, FileText, Copy, Check, Terminal } from 'lucide-react'
-import { api } from '@/lib/api'
+import { api, friendlyStreamError } from '@/lib/api'
+import type { AiIterateRound } from '@/lib/api'
 import { storage } from '@/lib/storage'
 import { cn } from '@/lib/cn'
 
@@ -73,6 +74,16 @@ function parseMetaField(code: string, field: string): string {
   return m ? m[1] : ''
 }
 
+// 回测 stats 均为比率 (0.15 = 15%), 按 key 语义格式化为可读文本
+function fmtStat(key: string, v: any): string {
+  if (v === null || v === undefined || typeof v !== 'number') return '—'
+  if (key === 'n_trades') return String(Math.round(v))
+  if (['total_return', 'annual_return', 'max_drawdown', 'win_rate'].includes(key)) {
+    return (v * 100).toFixed(2) + '%'
+  }
+  return v.toFixed(2)
+}
+
 // ===== 常量 =====
 
 const DIRECTIONS = [
@@ -91,10 +102,16 @@ META = {
     "name": "我的策略",
     "description": "策略描述",
     "tags": ["自定义"],
+    "asset_types": ["stock"],
+    "timeframes": ["1d"],
     "basic_filter": {
-        "price_min": 3, "price_max": 200,
-        "market_cap_min": 10e8, "amount_min": 0.5e8,
+        "price_min": 5, "price_max": 200,
+        "market_cap_min": None,
+        "float_cap_min": 30e8, "float_cap_max": 1500e8,
+        "amount_min": None,
+        "turnover_min": 1,
         "exclude_st": True, "exclude_new_days": 30,
+        "boards": ["沪主板", "深主板", "创业板", "科创板"],
     },
     "params": [],
     "scoring": {
@@ -105,11 +122,11 @@ META = {
     "limit": 100,
 }
 
+EXECUTION_BACKEND = "polars_expr"
 ENTRY_SIGNALS = ["signal_n_day_high"]
 EXIT_SIGNALS = ["signal_ma20_breakdown"]
 STOP_LOSS = -0.05
 MAX_HOLD_DAYS = 20
-ALERTS = []
 
 RULES = """
 1. 规则一
@@ -124,9 +141,62 @@ def filter(df: pl.DataFrame, params: dict) -> pl.Expr:
     )
 `
 
-interface Props { open: boolean; onClose: () => void; onSavedId?: (id: string) => void | Promise<void>; mode?: 'create' | 'modify' }
+const MATRIX_TEMPLATE = `"""矩阵原生策略示例"""
+import numpy as np
+from app.backtest.matrix import MarketDataMatrix, SignalMatrix, make_signal_matrix, matrix_feature
 
-export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create' }: Props) {
+META = {
+    "id": "custom_matrix_strategy",
+    "name": "矩阵策略",
+    "description": "收盘价站上 MA20",
+    "tags": ["自定义", "矩阵"],
+    "asset_types": ["stock"],
+    "timeframes": ["1d"],
+    "basic_filter": {
+        "price_min": 5, "price_max": 200,
+        "market_cap_min": None,
+        "float_cap_min": 30e8, "float_cap_max": 1500e8,
+        "amount_min": None,
+        "turnover_min": 1,
+        "exclude_st": True, "exclude_new_days": 30,
+        "boards": ["沪主板", "深主板", "创业板", "科创板"],
+    },
+    "params": [],
+    "scoring": {},
+    "order_by": "score",
+    "descending": True,
+    "limit": 100,
+}
+
+EXECUTION_BACKEND = "matrix_native"
+ENTRY_SIGNALS = []
+EXIT_SIGNALS = []
+STOP_LOSS = -0.05
+MAX_HOLD_DAYS = 20
+
+class CustomMatrixStrategy:
+    def required_fields(self) -> frozenset[str]:
+        return frozenset({"close", "ma20"})
+
+    def required_warmup_bars(self, params: dict) -> int:
+        return 60
+
+    def compute_signals(self, market: MarketDataMatrix, params: dict) -> SignalMatrix:
+        entry = market.close > matrix_feature(market, "ma20")
+        return make_signal_matrix(market.shape, entry=entry.astype(np.uint8))
+
+MATRIX_STRATEGY = CustomMatrixStrategy()
+`
+
+interface Props {
+  open: boolean
+  onClose: () => void
+  onSavedId?: (id: string, researchOnly?: boolean) => void | Promise<void>
+  mode?: 'create' | 'modify'
+  existingStrategyIds?: ReadonlySet<string>
+}
+
+export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create', existingStrategyIds }: Props) {
   // 根据 mode 选择存储 key
   const draftStore = mode === 'modify' ? storage.strategyModify : storage.strategyDraft
   const [step, setStep] = useState(1)
@@ -135,6 +205,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [direction, setDirection] = useState('long')
+  const [executionBackend, setExecutionBackend] = useState<'polars_expr' | 'matrix_native'>('polars_expr')
   const [rules, setRules] = useState('')
   const [code, setCode] = useState('')
   const [instruction, setInstruction] = useState('')
@@ -149,20 +220,50 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
   const [aiStatus, setAiStatus] = useState<{ configured: boolean } | null>(null)
   const [checkedAi, setCheckedAi] = useState(false)
   const [loaded, setLoaded] = useState(false)
+  const [iterateEnabled, setIterateEnabled] = useState(false)
+  const [iterateRounds, setIterateRounds] = useState<AiIterateRound[]>([])
+  const [iterateDraftId, setIterateDraftId] = useState('')
+  const suppressPersistRef = useRef(false)
+  // 迭代落盘的代码基准 (检测用户在编辑器是否改过, 见 handleSave)
+  const iterateSavedCodeRef = useRef('')
+
+  const resetDraftState = useCallback(() => {
+    setStep(1); setTab('ai'); setName(''); setDescription(''); setDirection('long')
+    setExecutionBackend('polars_expr'); setRules(''); setCode(''); setInstruction('')
+    setPreviewTab('params'); setStrategyId(''); setSource('ai'); setValidated(false); setError('')
+    setIterateEnabled(false); setIterateRounds([]); setIterateDraftId('')
+    iterateSavedCodeRef.current = ''
+  }, [])
 
   // 打开时恢复草稿
   useEffect(() => {
     if (!open) { setLoaded(false); return }
     const d = draftStore.get(null)
-    if (d) {
+    const draftCodeId = d ? parseMetaField(d.code ?? '', 'id') : ''
+    const completedDraft = mode === 'create' && !!d && (
+      (!!d.strategyId && existingStrategyIds?.has(d.strategyId))
+      || (!!draftCodeId && existingStrategyIds?.has(draftCodeId))
+    )
+    if (completedDraft) {
+      draftStore.set(null)
+      resetDraftState()
+    } else if (d) {
+      const restoredSource = d.source ?? (d.strategyId?.startsWith('custom_') ? 'custom' : 'ai')
       setStep(d.step ?? 1); setName(d.name ?? ''); setDescription(d.description ?? '')
       setDirection(d.direction ?? 'long')
+      setExecutionBackend(
+        (d as any).executionBackend
+        ?? (String(d.code ?? '').includes('matrix_native') ? 'matrix_native' : 'polars_expr'),
+      )
       setRules(d.rules ?? ''); setCode(d.code ?? ''); setStrategyId(d.strategyId ?? '')
-      setSource((d as any).source ?? (d.strategyId?.startsWith('custom_') ? 'custom' : 'ai'))
-      if (mode === 'modify') setTab('custom')
+      setSource(restoredSource)
+      setTab(mode === 'modify' || restoredSource === 'custom' ? 'custom' : 'ai')
+    } else {
+      resetDraftState()
     }
+    suppressPersistRef.current = false
     setLoaded(true)
-  }, [open])
+  }, [open, mode, draftStore, existingStrategyIds, resetDraftState])
 
   // 打开时检查 AI 状态
   useEffect(() => {
@@ -175,19 +276,22 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
     if (!name && !rules && !code) {
       draftStore.set(null)
     } else {
-      draftStore.set({ name, description, direction, rules, code, step, strategyId, source } as any)
+      draftStore.set({ name, description, direction, executionBackend, rules, code, step, strategyId, source } as any)
     }
-  }, [name, description, direction, rules, code, step, strategyId, source])
-  useEffect(() => { if (loaded) persist() }, [loaded, persist])
+  }, [draftStore, name, description, direction, executionBackend, rules, code, step, strategyId, source])
+  useEffect(() => {
+    if (loaded && !suppressPersistRef.current) persist()
+  }, [loaded, persist])
 
   const clearDraft = () => {
     draftStore.set(null)
-    setName(''); setDescription(''); setDirection('long')
-    setRules(''); setCode(''); setStep(1); setError(''); setInstruction('')
-    setStrategyId(''); setSource('ai'); setValidated(false)
+    resetDraftState()
   }
 
-  const handleClose = () => { if (name || rules || code) persist(); onClose() }
+  const handleClose = () => {
+    if (!suppressPersistRef.current && (name || rules || code)) persist()
+    onClose()
+  }
 
   const resolveStrategyId = (target: 'ai' | 'custom' = source) => {
     if (mode === 'modify' && strategyId) return strategyId
@@ -195,33 +299,57 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
     return slugId(target)
   }
 
+  const selectExecutionBackend = (backend: 'polars_expr' | 'matrix_native') => {
+    setExecutionBackend(backend)
+    if (tab === 'custom' && (!code || code === CUSTOM_TEMPLATE || code === MATRIX_TEMPLATE)) {
+      setCode(backend === 'matrix_native' ? MATRIX_TEMPLATE : CUSTOM_TEMPLATE)
+    }
+  }
+
   // Step 1: 生成
   const handleGenerate = async () => {
     if (!name.trim() || !rules.trim()) return
     if (!aiStatus?.configured) { setError('AI 未配置，请在设置页面配置 API Key'); return }
-    setLoading(true); setError(''); setCode(''); setValidated(false)
+    setLoading(true); setError(''); setCode(''); setValidated(false); setIterateRounds([]); setIterateDraftId('')
     try {
-      const id = resolveStrategyId('ai')
-      setStrategyId(id); setSource('ai'); setPreviewTab('code')
-      let finalResult: any = null
-      for await (const evt of api.strategyBuildStream(1, { name: name.trim(), description: description.trim(), direction, rules: rules.trim(), strategy_id: id })) {
-        if (evt.type === 'delta') {
-          setCode(prev => prev + evt.content)
-        } else if (evt.type === 'error') {
-          throw new Error(evt.message)
-        } else if (evt.type === 'result') {
-          finalResult = evt
+      if (iterateEnabled) {
+        // AI 迭代: 生成 → 回测 → 诊断 → 修改 闭环, 草稿已由后端落盘
+        const result = await api.strategyAiIterate({
+          name: name.trim(), description: description.trim(), direction,
+          execution_backend: executionBackend, rules: rules.trim(), max_rounds: 4,
+        })
+        setCode(result.final_code)
+        iterateSavedCodeRef.current = result.final_code
+        setStrategyId(result.draft_strategy_id); setSource('ai')
+        setIterateDraftId(result.draft_strategy_id); setIterateRounds(result.rounds ?? [])
+        setStep(2); setValidated(true)
+        const genDesc = parseMetaField(result.final_code, 'description')
+        const genRules = parseRules(result.final_code)
+        if (genDesc) setDescription(genDesc)
+        if (genRules) setRules(genRules)
+      } else {
+        const id = resolveStrategyId('ai')
+        setStrategyId(id); setSource('ai'); setPreviewTab('code')
+        let finalResult: any = null
+        for await (const evt of api.strategyBuildStream(1, { name: name.trim(), description: description.trim(), direction, execution_backend: executionBackend, rules: rules.trim(), strategy_id: id })) {
+          if (evt.type === 'delta') {
+            setCode(prev => prev + evt.content)
+          } else if (evt.type === 'error') {
+            throw new Error(evt.message)
+          } else if (evt.type === 'result') {
+            finalResult = evt
+          }
         }
+        if (!finalResult) throw new Error('AI 未返回策略结果')
+        if (!finalResult.valid) { setError(finalResult.error ?? '生成失败'); return }
+        setCode(finalResult.code); setStep(2); setValidated(true)
+        const genDesc = parseMetaField(finalResult.code, 'description')
+        const genRules = parseRules(finalResult.code)
+        if (genDesc) setDescription(genDesc)
+        if (genRules) setRules(genRules)
       }
-      if (!finalResult) throw new Error('AI 未返回策略结果')
-      if (!finalResult.valid) { setError(finalResult.error ?? '生成失败'); return }
-      setCode(finalResult.code); setStep(2); setValidated(true)
-      const genDesc = parseMetaField(finalResult.code, 'description')
-      const genRules = parseRules(finalResult.code)
-      if (genDesc) setDescription(genDesc)
-      if (genRules) setRules(genRules)
     } catch (e: any) {
-      const msg = String(e?.message ?? '')
+      const msg = friendlyStreamError(String(e?.message ?? ''))
       setError(msg.includes('API Key') || msg.includes('api_key') ? 'AI API Key 未配置或无效' : (msg || '生成失败'))
     } finally { setLoading(false) }
   }
@@ -250,7 +378,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
       const updatedRules = parseRules(finalResult.code)
       if (genDesc) setDescription(genDesc)
       if (updatedRules) setRules(updatedRules)
-    } catch (e: any) { setError(String(e?.message ?? '修改失败')) }
+    } catch (e: any) { setError(friendlyStreamError(String(e?.message ?? '')) || '修改失败') }
     finally { setLoading(false) }
   }
 
@@ -278,10 +406,35 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
     if (!draftCode) return
     setSaving(true); setError('')
     try {
+      // 迭代模式: 后端已把草稿落盘到 data/strategies/ai/
+      if (iterateDraftId) {
+        // 用户若在编辑器改过代码, 先更新落盘草稿 (否则编辑会被静默丢弃)
+        let researchOnly = true
+        if (draftCode !== iterateSavedCodeRef.current) {
+          const savedResult = await api.strategySaveCodeV2({
+            strategy_id: iterateDraftId,
+            code: draftCode,
+            target_source: 'ai',
+            mode: 'update',
+            name: name.trim(),
+            description: description.trim(),
+          })
+          researchOnly = savedResult.research_only ?? true
+        }
+        suppressPersistRef.current = true
+        clearDraft()
+        const genRules = parseRules(draftCode)
+        const finalRules = (genRules || rules).trim()
+        if (finalRules) { const saved = storage.strategyRules.get({}); saved[iterateDraftId] = finalRules; storage.strategyRules.set(saved) }
+        await onSavedId?.(iterateDraftId, researchOnly)
+        setTimeout(() => onClose(), 1000)
+        setSaving(false)
+        return
+      }
       const target = mode === 'modify' ? source : (tab === 'custom' ? 'custom' : 'ai')
       const id = resolveStrategyId(target)
       setStrategyId(id); setSource(target)
-      await api.strategySaveCodeV2({
+      const savedResult = await api.strategySaveCodeV2({
         strategy_id: id,
         code: draftCode,
         target_source: target,
@@ -289,11 +442,12 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
         name: name.trim(),
         description: description.trim(),
       })
+      suppressPersistRef.current = true
       clearDraft()
       const genRules = parseRules(draftCode)
       const finalRules = (genRules || rules).trim()
       if (finalRules) { const saved = storage.strategyRules.get({}); saved[id] = finalRules; storage.strategyRules.set(saved) }
-      await onSavedId?.(id)
+      await onSavedId?.(id, savedResult.research_only)
       setTimeout(() => onClose(), 1000)
     } catch (e: any) { setError(String(e?.message ?? '保存失败')) }
     setSaving(false)
@@ -326,13 +480,13 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
               <button onClick={() => { setTab('ai'); if (mode === 'create') setSource('ai') }} className={cn('px-3 py-1 rounded-md text-xs font-medium transition-all cursor-pointer', tab === 'ai' ? 'bg-amber-400/15 text-amber-400' : 'text-muted hover:text-foreground')}>
                 <Sparkles className="h-3 w-3 inline mr-1" />AI 生成
               </button>
-              <button onClick={() => { setTab('custom'); if (mode === 'create') { setSource('custom'); if (!code) setCode(CUSTOM_TEMPLATE) } }} className={cn('px-3 py-1 rounded-md text-xs font-medium transition-all cursor-pointer', tab === 'custom' ? 'bg-accent/15 text-accent' : 'text-muted hover:text-foreground')}>
+              <button onClick={() => { setTab('custom'); if (mode === 'create') { setSource('custom'); if (!code) setCode(executionBackend === 'matrix_native' ? MATRIX_TEMPLATE : CUSTOM_TEMPLATE) } }} className={cn('px-3 py-1 rounded-md text-xs font-medium transition-all cursor-pointer', tab === 'custom' ? 'bg-accent/15 text-accent' : 'text-muted hover:text-foreground')}>
                 <FileText className="h-3 w-3 inline mr-1" />自定义编写
               </button>
             </div>
             {/* 中间：标题 */}
             <span id="strategy-builder-title" className="text-sm font-semibold text-foreground">
-              {strategyId ? '修改策略' : '创建策略'}
+              {mode === 'modify' ? '修改策略' : '创建策略'}
             </span>
             {/* 右侧：步骤 + 关闭 */}
             <div className="flex items-center justify-end gap-2">
@@ -403,16 +557,36 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                   </div>
                 </div>
                 <div>
+                  <span className="text-[10px] text-muted/50 uppercase tracking-wider mb-1.5 block">执行后端</span>
+                  <div className="flex gap-1">
+                    <button onClick={() => selectExecutionBackend('polars_expr')} className={'px-2.5 py-1 rounded text-[11px] font-medium border transition-colors ' + (executionBackend === 'polars_expr' ? 'border-amber-400/40 bg-amber-400/10 text-amber-400' : 'border-border bg-base text-muted hover:border-amber-400/30')}>Polars 表达式</button>
+                    <button onClick={() => selectExecutionBackend('matrix_native')} className={'px-2.5 py-1 rounded text-[11px] font-medium border transition-colors ' + (executionBackend === 'matrix_native' ? 'border-amber-400/40 bg-amber-400/10 text-amber-400' : 'border-border bg-base text-muted hover:border-amber-400/30')}>矩阵原生</button>
+                  </div>
+                </div>
+                <div>
                   <span className="text-[10px] text-muted/50 uppercase tracking-wider mb-1.5 block">策略规则</span>
                   <textarea value={rules} onChange={e => setRules(e.target.value)}
                     placeholder="描述你的选股逻辑，AI 会自动提取参数。例如：\n前一交易日为明显阴线且跌幅不低于2%，今日阳线收盘反包前一日实体，收盘价接近或高于前一日高点，成交量较前一日放大1.2倍以上，当前 close > ma5 或 close > ma10；使用 filter_history，并优先用 Polars shift/with_columns/filter 实现。"
                     className="w-full h-28 px-3 py-2 rounded-lg bg-base border-0 ring-1 ring-border/30 text-sm text-foreground placeholder:text-muted/30 resize-none focus:outline-none focus:ring-2 focus:ring-accent/30" />
                 </div>
+                <button type="button" onClick={() => setIterateEnabled(v => !v)}
+                  className="flex w-full items-center justify-between rounded-lg border border-border/30 bg-surface/30 px-3 py-2 cursor-pointer select-none">
+                  <span className="flex items-center gap-1.5 text-[11px] text-secondary">
+                    <Terminal className="h-3.5 w-3.5 text-emerald-400" />
+                    AI 迭代（自动回测诊断优化）
+                  </span>
+                  <span className={cn('relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors', iterateEnabled ? 'bg-emerald-400/40' : 'bg-border')}>
+                    <span className={cn('inline-block h-4 w-4 rounded-full bg-white transform transition-transform', iterateEnabled ? 'translate-x-[18px]' : 'translate-x-[2px]')} />
+                  </span>
+                </button>
+                {iterateEnabled && (
+                  <div className="text-[10px] text-muted/60 leading-relaxed">开启后 AI 会先回测再诊断修改，最多迭代 4 轮，耗时更长；结果保存为草稿，仍需你点「保存策略」加入策略池。</div>
+                )}
                 {error && <div className="text-[11px] text-danger bg-danger/10 border border-danger/20 rounded-lg px-3 py-2">{error}</div>}
                 <button onClick={handleGenerate} disabled={loading || !name.trim() || !rules.trim()}
                   className="w-full h-10 rounded-xl bg-gradient-to-r from-amber-500/20 to-amber-500/10 border border-amber-400/30 text-amber-400 text-sm font-medium flex items-center justify-center gap-2 hover:from-amber-500/30 hover:to-amber-500/20 disabled:opacity-40 transition-all">
                   {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-                  {loading ? 'AI 生成中...' : code ? '重新生成' : 'AI 生成策略'}
+                  {loading ? (iterateEnabled ? 'AI 迭代中...' : 'AI 生成中...') : code ? '重新生成' : (iterateEnabled ? 'AI 迭代生成' : 'AI 生成策略')}
                 </button>
               </>
             ) : (
@@ -424,6 +598,42 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                     <button onClick={() => setPreviewTab('code')} className={'px-3 py-1 rounded text-xs font-medium transition-colors ' + (previewTab === 'code' ? 'bg-amber-400/15 text-amber-400' : 'text-muted hover:text-secondary')}>代码</button>
                   </div>
                 </div>
+
+                {iterateRounds.length > 0 && (
+                  <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/5 px-3 py-2.5 space-y-1.5">
+                    <div className="flex items-center gap-1.5 text-[11px] text-emerald-400">
+                      <Terminal className="h-3.5 w-3.5" />
+                      迭代证据（共 {iterateRounds.length} 轮，草稿已保存为 {iterateDraftId}）
+                    </div>
+                    <div className="text-[10px] text-muted/50">每轮指标为该轮「改动前」基准回测；末行「最终版回测」为最终代码回测结果</div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-[10px]">
+                        <thead>
+                          <tr className="text-muted/50">
+                            <th className="text-left font-medium py-1 pr-2">轮次</th>
+                            <th className="text-right font-medium py-1 pr-2">总收益</th>
+                            <th className="text-right font-medium py-1 pr-2">最大回撤</th>
+                            <th className="text-right font-medium py-1 pr-2">夏普</th>
+                            <th className="text-right font-medium py-1 pr-2">胜率</th>
+                            <th className="text-left font-medium py-1">变更说明</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {iterateRounds.map(r => (
+                            <tr key={r.round} className="border-t border-border/20">
+                              <td className="py-1 pr-2 text-secondary">#{r.round}</td>
+                              <td className="text-right py-1 pr-2 font-mono">{fmtStat('total_return', r.stats?.total_return)}</td>
+                              <td className="text-right py-1 pr-2 font-mono">{fmtStat('max_drawdown', r.stats?.max_drawdown)}</td>
+                              <td className="text-right py-1 pr-2 font-mono">{fmtStat('sharpe', r.stats?.sharpe)}</td>
+                              <td className="text-right py-1 pr-2 font-mono">{fmtStat('win_rate', r.stats?.win_rate)}</td>
+                              <td className="py-1 text-muted">{r.change_summary}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
 
                 {previewTab === 'params' ? (
                   hasParams ? (
@@ -508,7 +718,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                     AI 修改
                   </button>
                 </div>
-                <p className="text-[10px] text-muted/40">修改指令可调整参数、信号、告警、评分等任意内容。确认无误后点击「保存策略」。</p>
+                <p className="text-[10px] text-muted/40">修改指令可调整参数、信号、评分等任意内容。确认无误后点击「保存策略」。</p>
               </>
             )}
             </>
@@ -521,6 +731,11 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                   <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="一句话描述策略逻辑"
                     className="h-9 px-3 rounded-lg bg-base border-0 ring-1 ring-border/30 text-sm text-foreground placeholder:text-muted/30 focus:outline-none focus:ring-2 focus:ring-accent/30" />
                 </div>
+                <div className="flex items-center gap-1">
+                  <span className="mr-2 text-[10px] text-muted/50 uppercase tracking-wider">执行后端</span>
+                  <button onClick={() => selectExecutionBackend('polars_expr')} className={'px-2.5 py-1 rounded text-[11px] font-medium border transition-colors ' + (executionBackend === 'polars_expr' ? 'border-accent/40 bg-accent/10 text-accent' : 'border-border bg-base text-muted')}>Polars 表达式</button>
+                  <button onClick={() => selectExecutionBackend('matrix_native')} className={'px-2.5 py-1 rounded text-[11px] font-medium border transition-colors ' + (executionBackend === 'matrix_native' ? 'border-accent/40 bg-accent/10 text-accent' : 'border-border bg-base text-muted')}>矩阵原生</button>
+                </div>
                 <div className="rounded-xl border border-border/40 bg-elevated/50 p-4 space-y-2.5">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
@@ -528,7 +743,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                       <span className="text-sm font-medium text-foreground">自定义策略代码</span>
                       {validated && <span className="text-[10px] text-emerald-400">已校验</span>}
                     </div>
-                    <button onClick={() => { navigator.clipboard.writeText(code || CUSTOM_TEMPLATE); setCustomCopied(true); setTimeout(() => setCustomCopied(false), 2000) }}
+                    <button onClick={() => { navigator.clipboard.writeText(code || (executionBackend === 'matrix_native' ? MATRIX_TEMPLATE : CUSTOM_TEMPLATE)); setCustomCopied(true); setTimeout(() => setCustomCopied(false), 2000) }}
                       className={cn('inline-flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-all cursor-pointer', customCopied ? 'bg-emerald-400/10 text-emerald-400' : 'bg-elevated text-muted hover:text-foreground hover:bg-accent/10')}>
                       {customCopied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
                       {customCopied ? '已复制' : '复制代码'}
@@ -545,7 +760,7 @@ export function StrategyBuilderDialog({ open, onClose, onSavedId, mode = 'create
                   </div>
                   {error && <div className="text-[11px] text-danger bg-danger/10 border border-danger/20 rounded-lg px-3 py-2">{error}</div>}
                   <div className="flex items-center justify-end gap-2">
-                    <button onClick={() => { setCode(CUSTOM_TEMPLATE); setStrategyId(''); setSource('custom'); setValidated(false) }}
+                    <button onClick={() => { setCode(executionBackend === 'matrix_native' ? MATRIX_TEMPLATE : CUSTOM_TEMPLATE); setStrategyId(''); setSource('custom'); setValidated(false) }}
                       className="h-8 px-3 rounded-lg border border-border text-xs text-secondary hover:text-foreground">
                       使用模板
                     </button>

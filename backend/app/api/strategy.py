@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import math
 import re
 from dataclasses import asdict
@@ -15,15 +16,23 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from app.backtest.minute_trigger import MINUTE_EXIT_TRIGGER_SIGNALS
 from app.strategy import config as strategy_config
-from app.strategy.ai_generator import AIStrategyGenerator
+from app.strategy.ai_generator import AIStrategyGenerator, find_meta_assignment
 from app.strategy.engine import StrategyDef, StrategyEngine
 from app.strategy.monitor import StrategyMonitorService
 from app.strategy.prompt_builder import build_step1, build_step2
+from app.strategy.scoring import (
+    SCORING_DIRECTIONS,
+    effective_scoring,
+    effective_scoring_directions,
+)
+from app.services.ndjson_heartbeat import with_heartbeat
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
+logger = logging.getLogger(__name__)
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -33,6 +42,16 @@ def _get_engine(request: Request) -> StrategyEngine:
     if not engine:
         raise HTTPException(status_code=503, detail="策略引擎未初始化")
     return engine
+
+
+def _get_public_strategy(engine: StrategyEngine, strategy_id: str) -> StrategyDef:
+    try:
+        strategy = engine.get(strategy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if strategy.meta.get("research_only"):
+        raise HTTPException(status_code=404, detail=f"unknown strategy: {strategy_id}")
+    return strategy
 
 
 def _get_monitor(request: Request) -> StrategyMonitorService:
@@ -46,6 +65,82 @@ def _data_dir(request: Request) -> Path:
     return request.app.state.repo.store.data_dir
 
 
+def _invalidate_strategy_runtime(request: Request) -> None:
+    from app.services import strategy_cache
+
+    strategy_cache.clear_cache(_data_dir(request))
+    monitor_engine = getattr(request.app.state, "monitor_engine", None)
+    if monitor_engine is not None:
+        monitor_engine.invalidate_strategy_state()
+
+
+def _missing_custom_signals(data_dir: Path, required_features) -> list[str]:
+    """required_features 中 csg_ 列对应信号未定义的部分 (保存策略前校验)。
+
+    自定义信号列 (csg_ 前缀) 只有在 data/user_data/custom_signals/*.json
+    有对应定义时才会被注入; 引用不存在的信号运行必报缺列错, 保存时早失败。
+    """
+    from app.strategy import custom_signals
+
+    defined = {s.get("id") for s in custom_signals.load_all(data_dir)}
+    return [
+        name for name in (required_features or ())
+        if isinstance(name, str) and name.startswith(custom_signals.PREFIX)
+        and name[len(custom_signals.PREFIX):] not in defined
+    ]
+
+
+def _cleanup_deleted_strategy(request: Request, strategy_id: str) -> list[str]:
+    """尽力清理删除后的派生状态, 清理失败不应把已成功的源文件删除变成 500。"""
+    from app.services import preferences
+    from app.strategy import monitor_rules
+
+    data_dir = _data_dir(request)
+    warnings: list[str] = []
+
+    try:
+        strategy_config.delete_override(data_dir, strategy_id)
+    except Exception as e:
+        warnings.append(f"覆盖配置清理失败: {e}")
+
+    try:
+        _invalidate_strategy_runtime(request)
+    except Exception as e:
+        warnings.append(f"运行缓存清理失败: {e}")
+
+    try:
+        monitored_ids = preferences.get_strategy_monitor_ids()
+        if strategy_id in monitored_ids:
+            preferences.set_realtime_monitor_config({
+                "strategy_monitor_ids": [sid for sid in monitored_ids if sid != strategy_id],
+            })
+    except Exception as e:
+        warnings.append(f"监控偏好清理失败: {e}")
+
+    try:
+        rules_changed = False
+        for rule in monitor_rules.load_all(data_dir):
+            if (
+                rule.get("type") == "strategy"
+                and rule.get("strategy_id") == strategy_id
+                and rule.get("enabled", True)
+            ):
+                rule = dict(rule)
+                rule["enabled"] = False
+                monitor_rules.save_one(data_dir, rule)
+                rules_changed = True
+
+        monitor_engine = getattr(request.app.state, "monitor_engine", None)
+        if rules_changed and monitor_engine is not None:
+            monitor_engine.set_rules(monitor_rules.load_all(data_dir))
+    except Exception as e:
+        warnings.append(f"关联监控清理失败: {e}")
+
+    for warning in warnings:
+        logger.warning("delete strategy %s: %s", strategy_id, warning)
+    return warnings
+
+
 def _safe(result_dict: dict) -> dict:
     rows = result_dict.get("rows", [])
     for r in rows:
@@ -55,17 +150,31 @@ def _safe(result_dict: dict) -> dict:
     return result_dict
 
 
-def _strategy_detail(s: StrategyDef, overrides: dict | None = None) -> dict:
+def _child_meta(engine: StrategyEngine | None, child_id: str) -> dict:
+    """查询子策略的可读名称与来源; engine 缺失或子策略不存在时回退为 id/unknown。"""
+    if engine is None:
+        return {"name": child_id, "source": "unknown"}
+    try:
+        child = engine.get(child_id)
+    except ValueError:
+        return {"name": child_id, "source": "unknown"}
+    return {"name": str(child.meta.get("name") or child_id), "source": child.source}
+
+
+def _strategy_detail(
+    s: StrategyDef,
+    overrides: dict | None = None,
+    engine: StrategyEngine | None = None,
+) -> dict:
     """策略详情（含用户覆盖）"""
     bf = {**s.basic_filter}
-    scoring = dict(s.meta.get("scoring", {}))
+    scoring = effective_scoring(s.meta.get("scoring"), overrides)
+    scoring_directions = effective_scoring_directions(overrides)
     params_defaults = {p["id"]: p["default"] for p in s.meta.get("params", [])}
 
     if overrides:
         if overrides.get("basic_filter"):
             bf.update(overrides["basic_filter"])
-        if overrides.get("scoring"):
-            scoring.update(overrides["scoring"])
         # 用户保存的参数覆盖默认值: 合并进 params_defaults, 前端据此回显
         if overrides.get("params"):
             params_defaults.update(overrides["params"])
@@ -80,24 +189,46 @@ def _strategy_detail(s: StrategyDef, overrides: dict | None = None) -> dict:
         "description": description or s.meta.get("description", ""),
         "tags": s.meta.get("tags", []),
         "source": s.source,
+        "research_only": s.meta.get("research_only", False),
+        "execution_backend": s.execution_backend,
+        "asset_types": s.meta.get("asset_types", ["stock"]),
+        "timeframes": s.meta.get("timeframes", ["1d"]),
         "version": s.meta.get("version", "1.0.0"),
         "basic_filter": bf,
         "params": s.meta.get("params", []),
         "params_defaults": params_defaults,
         "scoring": scoring,
+        "scoring_directions": {
+            name: direction
+            for name, direction in scoring_directions.items()
+            if name in scoring
+        },
         "entry_signals": overrides.get("entry_signals", s.entry_signals) if overrides else s.entry_signals,
         "exit_signals": overrides.get("exit_signals", s.exit_signals) if overrides else s.exit_signals,
+        "minute_exit_trigger_supported_signals": sorted(MINUTE_EXIT_TRIGGER_SIGNALS),
         "stop_loss": overrides.get("stop_loss", s.stop_loss) if overrides else s.stop_loss,
         "take_profit": getattr(s, "take_profit", None),
         "trailing_stop": getattr(s, "trailing_stop", None),
         "trailing_take_profit_activate": getattr(s, "trailing_take_profit_activate", None),
         "trailing_take_profit_drawdown": getattr(s, "trailing_take_profit_drawdown", None),
         "max_hold_days": overrides.get("max_hold_days", s.max_hold_days) if overrides else s.max_hold_days,
-        "alerts": s.alerts,
         "order_by": s.meta.get("order_by", "score"),
         "descending": s.meta.get("descending", True),
         "limit": s.meta.get("limit", 30),
         "display_limit": overrides.get("display_limit") if overrides and "display_limit" in overrides else None,
+        # 叠加策略: 子策略列表与权重(供前端展示)。override.children 可覆盖 META 固化值。
+        "composite_children": (
+            [
+                {
+                    "id": c["strategy_id"],
+                    **_child_meta(engine, c["strategy_id"]),
+                    "weight": c.get("weight", 1.0),
+                }
+                for c in (overrides.get("children") if overrides and isinstance(overrides.get("children"), list) else s.meta.get("children", []))
+            ]
+            if s.execution_backend == "composite"
+            else None
+        ),
     }
 
 
@@ -109,10 +240,14 @@ class RunRequest(BaseModel):
     as_of: date | None = None
     pool: list[str] | None = None
     params: dict | None = None
+    asset_type: str = "stock"
+    timeframe: str = "1d"
 
 
 class RunAllRequest(BaseModel):
     as_of: date | None = None
+    asset_type: str = "stock"
+    timeframe: str = "1d"
 
 
 class SaveConfigRequest(BaseModel):
@@ -122,6 +257,16 @@ class SaveConfigRequest(BaseModel):
 
 class AIGenerateRequest(BaseModel):
     prompt: str
+
+
+class AIIterateRequest(BaseModel):
+    """AI 迭代请求 — 与 BuildRequest step1 同构, 复用 build_step1 拼 prompt"""
+    name: str = ""
+    description: str = ""
+    direction: str = "long"
+    rules: str = ""
+    execution_backend: Literal["polars_expr", "matrix_native"] = "polars_expr"
+    max_rounds: int = Field(default=4, ge=1, le=10)
 
 
 class AISaveRequest(BaseModel):
@@ -147,6 +292,21 @@ class StrategyCodeSaveRequest(BaseModel):
     description: str = ""
 
 
+class CompositeChildItem(BaseModel):
+    strategy_id: str
+    weight: float = 1.0
+
+
+class StrategyCompositeSaveRequest(BaseModel):
+    strategy_id: str
+    name: str = ""
+    description: str = ""
+    children: list[CompositeChildItem]
+    merge_mode: Literal["union", "intersect"] = "union"
+    min_confirm: int = 0
+    mode: Literal["create", "update"] = "create"
+
+
 class MonitorStartRequest(BaseModel):
     strategy_id: str
 
@@ -155,29 +315,39 @@ class MonitorStartRequest(BaseModel):
 
 
 @router.get("")
-def list_strategies(request: Request):
+def list_strategies(
+    request: Request,
+    asset_type: str | None = None,
+    timeframe: str | None = None,
+    include_research: bool = False,
+):
     engine = _get_engine(request)
     data_dir = _data_dir(request)
     all_overrides = strategy_config.list_overrides(data_dir)
 
     result = []
-    for meta in engine.list_strategies():
+    # include_research=True 时返回 research_only 草稿(供前端「草稿」分区展示/发布)。
+    # 默认 False 保持既有行为: 草稿不进公开列表。
+    for meta in engine.list_strategies(include_research=include_research):
+        if meta.get("research_only") and not include_research:
+            continue
+        if asset_type and asset_type not in meta.get("asset_types", ["stock"]):
+            continue
+        if timeframe and timeframe not in meta.get("timeframes", ["1d"]):
+            continue
         sid = meta["id"]
         s = engine.get(sid)
         overrides = all_overrides.get(sid)
-        result.append(_strategy_detail(s, overrides))
-    return {"strategies": result}
+        result.append(_strategy_detail(s, overrides, engine))
+    return {"strategies": result, "load_errors": engine.load_errors()}
 
 
 @router.get("/{strategy_id}")
 def get_strategy(strategy_id: str, request: Request):
     engine = _get_engine(request)
-    try:
-        s = engine.get(strategy_id)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    s = _get_public_strategy(engine, strategy_id)
     overrides = strategy_config.load_override(_data_dir(request), strategy_id)
-    return _strategy_detail(s, overrides or None)
+    return _strategy_detail(s, overrides or None, engine)
 
 
 # ── 执行选股 ─────────────────────────────────────────────────────────
@@ -186,6 +356,7 @@ def get_strategy(strategy_id: str, request: Request):
 @router.post("/run")
 def run_strategy(req: RunRequest, request: Request):
     engine = _get_engine(request)
+    _get_public_strategy(engine, req.strategy_id)
     data_dir = _data_dir(request)
 
     # 读取用户覆盖配置
@@ -201,14 +372,25 @@ def run_strategy(req: RunRequest, request: Request):
     as_of = req.as_of
     if not as_of:
         from app.services.screener import ScreenerService
-        svc = ScreenerService(request.app.state.repo)
+        svc = ScreenerService(request.app.state.repo, asset_type=req.asset_type)
         as_of = svc.latest_date()
     if not as_of:
         raise HTTPException(status_code=400, detail="无可用数据日期")
 
     try:
+        from app.services.screener import ScreenerService
+        svc = ScreenerService(request.app.state.repo, asset_type=req.asset_type)
+        context = svc.build_strategy_context(
+            engine,
+            as_of,
+            [req.strategy_id],
+            timeframe=req.timeframe,
+            params_map={req.strategy_id: params},
+            overrides_map={req.strategy_id: overrides or {}},
+        )
         result = engine.run(
-            req.strategy_id, as_of,
+            req.strategy_id,
+            context,
             pool=req.pool,
             params=params,
             overrides=overrides or None,
@@ -227,14 +409,40 @@ def run_all(req: RunAllRequest, request: Request):
     as_of = req.as_of
     if not as_of:
         from app.services.screener import ScreenerService
-        svc = ScreenerService(request.app.state.repo)
+        svc = ScreenerService(request.app.state.repo, asset_type=req.asset_type)
         as_of = svc.latest_date()
     if not as_of:
         return {"as_of": None, "results": {}}
 
     all_overrides = strategy_config.list_overrides(data_dir)
+    strategy_ids = [
+        meta["id"]
+        for meta in engine.list_strategies()
+        if not meta.get("research_only")
+        and req.asset_type in meta.get("asset_types", ["stock"])
+        and req.timeframe in meta.get("timeframes", ["1d"])
+    ]
+    from app.services.screener import ScreenerService
+    svc = ScreenerService(request.app.state.repo, asset_type=req.asset_type)
+    params_map = {
+        sid: dict((all_overrides.get(sid) or {}).get("params") or {})
+        for sid in strategy_ids
+    }
+    context = svc.build_strategy_context(
+        engine,
+        as_of,
+        strategy_ids,
+        timeframe=req.timeframe,
+        params_map=params_map,
+        overrides_map={sid: all_overrides.get(sid, {}) for sid in strategy_ids},
+    )
     results: dict[str, dict] = {}
-    for sid, result in engine.run_all(as_of, overrides_map=all_overrides).items():
+    for sid, result in engine.run_all(
+        context,
+        params_map=params_map,
+        overrides_map={sid: all_overrides.get(sid, {}) for sid in strategy_ids},
+        strategy_ids=strategy_ids,
+    ).items():
         results[sid] = {"total": result.total, "as_of": str(as_of)}
 
     return {"as_of": str(as_of), "results": results}
@@ -246,14 +454,51 @@ def run_all(req: RunAllRequest, request: Request):
 @router.post("/config")
 def save_config(req: SaveConfigRequest, request: Request):
     engine = _get_engine(request)
-    if not engine.has(req.strategy_id):
-        raise HTTPException(status_code=404, detail=f"策略 {req.strategy_id} 不存在")
+    _get_public_strategy(engine, req.strategy_id)
 
+    _validate_scoring_config(req.overrides)
     # 剥离与策略默认值相同的字段，只保存用户真正修改过的值
     overrides = _strip_defaults(req.strategy_id, req.overrides, engine)
 
     strategy_config.save_override(_data_dir(request), req.strategy_id, overrides)
     return {"ok": True}
+
+
+@router.patch("/config")
+def patch_config(req: SaveConfigRequest, request: Request):
+    engine = _get_engine(request)
+    _get_public_strategy(engine, req.strategy_id)
+    data_dir = _data_dir(request)
+    overrides = strategy_config.load_override(data_dir, req.strategy_id)
+    overrides.update(req.overrides)
+    _validate_scoring_config(overrides)
+    strategy_config.save_override(
+        data_dir,
+        req.strategy_id,
+        _strip_defaults(req.strategy_id, overrides, engine),
+    )
+    return {"ok": True}
+
+
+def _validate_scoring_config(overrides: dict) -> None:
+    scoring = overrides.get("scoring")
+    if scoring is not None:
+        if not isinstance(scoring, dict):
+            raise HTTPException(status_code=400, detail="评分权重必须是对象")
+        for name, weight in scoring.items():
+            if not isinstance(name, str) or not name:
+                raise HTTPException(status_code=400, detail="评分因子名称无效")
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight < 0:
+                raise HTTPException(status_code=400, detail=f"评分因子 {name} 的权重必须是非负数")
+    directions = overrides.get("scoring_directions")
+    if directions is not None:
+        if not isinstance(directions, dict):
+            raise HTTPException(status_code=400, detail="评分方向必须是对象")
+        invalid = [name for name, direction in directions.items() if direction not in SCORING_DIRECTIONS]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"评分因子 {invalid[0]} 的方向无效")
+    if "scoring_replace" in overrides and not isinstance(overrides["scoring_replace"], bool):
+        raise HTTPException(status_code=400, detail="scoring_replace 必须是布尔值")
 
 
 def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
@@ -286,6 +531,7 @@ def _strip_defaults(strategy_id: str, overrides: dict, engine) -> dict:
 
 @router.delete("/config/{strategy_id}")
 def reset_config(strategy_id: str, request: Request):
+    _get_public_strategy(_get_engine(request), strategy_id)
     strategy_config.delete_override(_data_dir(request), strategy_id)
     return {"ok": True}
 
@@ -301,6 +547,7 @@ class BuildRequest(BaseModel):
     direction: str = "long"
     rules: str = ""
     strategy_id: str = ""
+    execution_backend: Literal["polars_expr", "matrix_native"] = "polars_expr"
     # step2 字段
     current_code: str = ""
     instruction: str = ""
@@ -311,25 +558,10 @@ def _py_string(value: str) -> str:
 
 
 def _find_meta_dict(code: str) -> ast.Dict:
-    # 兼容两种 LLM 常见写法:
-    #   META = {...}        → ast.Assign
-    #   META: dict = {...}  → ast.AnnAssign (类型注解, 合法但旧逻辑漏匹配)
-    tree = ast.parse(code)
-    for node in ast.walk(tree):
-        value = None
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "META":
-                    value = node.value
-                    break
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
-                and node.target.id == "META":
-            value = node.value
-        if value is not None:
-            if not isinstance(value, ast.Dict):
-                raise ValueError("META 必须是字面量字典")
-            return value
-    raise ValueError("找不到 META 字典")
+    found = find_meta_assignment(code)
+    if found is None:
+        raise ValueError("找不到 META 字典")
+    return found[1]
 
 
 def _set_meta_string_field(block: str, field: str, value: str) -> str:
@@ -343,7 +575,11 @@ def _set_meta_string_field(block: str, field: str, value: str) -> str:
     )
     if count:
         return next_block
+    return _insert_meta_field(block, field, _py_string(value))
 
+
+def _insert_meta_field(block: str, field: str, value_repr: str) -> str:
+    """在 META 字典末尾(闭合 `}` 之前)插入一个字段。value_repr 已是 Python 源码。"""
     lines = block.splitlines(keepends=True)
     key_indent = None
     for line in lines:
@@ -368,7 +604,33 @@ def _set_meta_string_field(block: str, field: str, value: str) -> str:
             newline = lines[i][len(body):]
             lines[i] = body.rstrip() + "," + newline
         break
-    lines.insert(insert_at, f'{key_indent}"{field}": {_py_string(value)},\n')
+    lines.insert(insert_at, f'{key_indent}"{field}": {value_repr},\n')
+    return "".join(lines)
+
+
+def _set_meta_bool_field(code: str, field: str, value: bool) -> str:
+    """设置 META 里的布尔字段(纯文本改写, 不执行代码): 存在则替换, 不存在则追加。"""
+    found = find_meta_assignment(code)
+    if found is None:
+        raise ValueError("找不到 META 字典")
+    meta_node = found[1]
+    lines = code.splitlines(keepends=True)
+    start = meta_node.lineno - 1
+    end = meta_node.end_lineno or meta_node.lineno
+    block = "".join(lines[start:end])
+
+    value_repr = "True" if value else "False"
+    key_pattern = re.compile(
+        rf"(?m)^(\s*[\"']{re.escape(field)}[\"']\s*:\s*)(?:True|False|[\"'][^\"'\n]*[\"'])"
+    )
+    next_block, count = key_pattern.subn(
+        lambda m: f"{m.group(1)}{value_repr}",
+        block,
+        count=1,
+    )
+    if not count:
+        next_block = _insert_meta_field(block, field, value_repr)
+    lines[start:end] = next_block.splitlines(keepends=True)
     return "".join(lines)
 
 
@@ -376,7 +638,22 @@ def _normalize_strategy_meta(code: str, strategy_id: str,
                              name: str | None = None,
                              description: str | None = None) -> str:
     """Force persisted strategy identity to match the caller-owned identity."""
-    meta_node = _find_meta_dict(code)
+    found = find_meta_assignment(code)
+    if found is None:
+        raise ValueError("找不到 META 字典")
+    target, meta_node = found
+    if target.id != "META":
+        lines = code.splitlines(keepends=True)
+        index = target.lineno - 1
+        raw_line = lines[index].encode("utf-8")
+        lines[index] = (
+            raw_line[:target.col_offset]
+            + b"META"
+            + raw_line[target.end_col_offset:]
+        ).decode("utf-8")
+        code = "".join(lines)
+        meta_node = _find_meta_dict(code)
+
     lines = code.splitlines(keepends=True)
     start = meta_node.lineno - 1
     end = meta_node.end_lineno or meta_node.lineno
@@ -418,8 +695,8 @@ def _validate_strategy_id(strategy_id: str) -> str:
 
 
 def _target_dir(data_dir: Path, source: str) -> Path:
-    if source not in {"ai", "custom"}:
-        raise ValueError("target_source 必须是 ai 或 custom")
+    if source not in {"ai", "custom", "composite"}:
+        raise ValueError("target_source 必须是 ai、custom 或 composite")
     return data_dir / "strategies" / source
 
 
@@ -443,6 +720,7 @@ def _prepare_strategy_code(req: StrategyCodeValidateRequest | StrategyCodeSaveRe
     # 安全校验始终执行 (此前 strict 字段可被客户端设 false 绕过, 已移除)
     AIStrategyGenerator._validate_safety(code)
     meta = AIStrategyGenerator._extract_meta(code)
+    AIStrategyGenerator._validate_meta_semantics(code, meta)
     return {"code": code, "meta": meta}
 
 
@@ -499,6 +777,13 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
     path.parent.mkdir(parents=True, exist_ok=True)
 
     prepared = _prepare_strategy_code(req)
+
+    # AI 新建策略默认草稿态(research_only=True): 不进公开列表、不可运行, 需显式 publish。
+    # 仅 create 注入; update 保留既有 research_only, 避免静默取消已发布状态。
+    if expected_source == "ai" and (legacy_ai_path or req.mode == "create"):
+        prepared["code"] = _set_meta_bool_field(prepared["code"], "research_only", True)
+        prepared["meta"] = AIStrategyGenerator._extract_meta(prepared["code"])
+
     previous_code = path.read_text(encoding="utf-8") if path.exists() else None
     path.write_text(prepared["code"], encoding="utf-8")
 
@@ -509,10 +794,20 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
             raise ValueError("策略加载到了非预期文件，请检查是否存在重复 strategy_id")
         if loaded.source != expected_source:
             raise ValueError(f"策略来源异常: 期望 {expected_source}, 实际 {loaded.source}")
+        # 自定义信号存在性校验: REQUIRED_FEATURES 里 csg_ 列必须已有定义,
+        # 否则运行必报缺列错。早失败并恢复文件, 提示用户先创建信号。
+        missing = _missing_custom_signals(data_dir, loaded.required_features)
+        if missing:
+            raise ValueError(
+                "策略引用了未定义的自定义信号: " + ", ".join(sorted(missing))
+                + " — 请先在「自定义信号」管理中创建对应信号后再保存"
+            )
     except Exception as e:
         _restore_strategy_file(path, previous_code)
         engine.reload()
         raise ValueError(f"策略保存失败: {e}") from e
+
+    _invalidate_strategy_runtime(request)
 
     return {
         "ok": True,
@@ -520,6 +815,7 @@ def _save_strategy_code(req: StrategyCodeSaveRequest, request: Request, *, legac
         "source": expected_source,
         "path": str(path),
         "meta": prepared["meta"],
+        "research_only": prepared["meta"].get("research_only", False),
     }
 
 
@@ -546,10 +842,7 @@ def get_strategy_source(strategy_id: str, request: Request):
 
     # 先查 StrategyEngine 获取文件路径
     engine = _get_engine(request)
-    try:
-        s = engine.get(strategy_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail=f"策略 {strategy_id} 不存在")
+    s = _get_public_strategy(engine, strategy_id)
 
     path = s.file_path
     if not path or not path.exists():
@@ -581,7 +874,14 @@ async def ai_test(request: Request):
 
 def _build_prompt(req: BuildRequest) -> str:
     if req.step == 1:
-        return build_step1(req.name, req.description, req.direction, req.rules, req.strategy_id)
+        return build_step1(
+            req.name,
+            req.description,
+            req.direction,
+            req.rules,
+            req.strategy_id,
+            req.execution_backend,
+        )
     if req.step == 2:
         return build_step2(req.current_code, req.instruction)
     raise ValueError(f"无效步骤: {req.step}")
@@ -625,6 +925,8 @@ async def build_strategy_stream(req: BuildRequest, request: Request):
                 chunks.append(chunk)
                 yield json.dumps({"type": "delta", "content": chunk}, ensure_ascii=False) + "\n"
             result = gen.validate_code("".join(chunks))
+            if gen.needs_structural_repair(result):
+                result = await gen.repair_code(result["code"], result["error"])
             if req.step == 1:
                 result = _normalize_build_result(result, req.strategy_id, req.name, req.description)
             elif req.strategy_id:
@@ -635,7 +937,11 @@ async def build_strategy_stream(req: BuildRequest, request: Request):
         except Exception as e:
             yield json.dumps({"type": "error", "message": f"AI生成失败: {e}"}, ensure_ascii=False) + "\n"
 
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        with_heartbeat(event_generator()),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 
@@ -648,6 +954,37 @@ async def ai_generate(req: AIGenerateRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI生成失败: {e}") from e
+    return result
+
+
+@router.post("/ai/iterate")
+async def ai_iterate(req: AIIterateRequest, request: Request):
+    """生成→回测→诊断→修改 的有界闭环 (只读回测, 产物为 ai_ 草稿, 不自动上线)。"""
+    from app.services.ai_provider import is_codex_cli_provider
+    from app.strategy.ai_iterator import AIStrategyIterator
+
+    # Codex CLI 无 tools= 协议, 迭代能力边界在入口 fail-closed (不静默降级为纯文本)。
+    if is_codex_cli_provider():
+        raise HTTPException(
+            status_code=400,
+            detail="当前 AI 供应商不支持工具调用迭代, 请改用 OpenAI 兼容模型",
+        )
+
+    engine = _get_engine(request)
+    data_dir = _data_dir(request)
+    try:
+        prompt = build_step1(
+            req.name, req.description, req.direction, req.rules,
+            strategy_id="", execution_backend=req.execution_backend,
+        )
+        iterator = AIStrategyIterator(max_rounds=req.max_rounds)
+        result = await iterator.iterate(prompt, engine=engine, data_dir=str(data_dir))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception:
+        # 内部异常详情只进日志, 不透给客户端 (§8)
+        logger.exception("AI 迭代失败")
+        raise HTTPException(status_code=500, detail="AI 迭代失败, 请稍后重试")
     return result
 
 
@@ -664,6 +1001,133 @@ def validate_strategy_code(req: StrategyCodeValidateRequest, request: Request):
 def save_strategy_code(req: StrategyCodeSaveRequest, request: Request):
     try:
         return _save_strategy_code(req, request)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _render_composite_code(
+    sid: str,
+    name: str,
+    description: str,
+    children: list[dict],
+    merge_mode: str,
+    min_confirm: int,
+) -> str:
+    """渲染声明式 composite 策略 .py 文件内容。
+
+    composite 不含业务代码, 仅通过 META.children 引用子策略 + EXECUTION_BACKEND 声明。
+    权重固化在 META; merge_mode/min_confirm 作为 params(可经 override 轻量调整)。
+    """
+    import json as _json
+
+    children_json = ",\n        ".join(
+        _json.dumps({"strategy_id": c["strategy_id"], "weight": c["weight"]}, ensure_ascii=False)
+        for c in children
+    )
+    safe_name = name or sid
+    return f'''"""叠加策略 {sid}（自动生成, 请勿手改业务逻辑）。"""
+META = {{
+    "id": {sid!r},
+    "name": {safe_name!r},
+    "description": {description!r},
+    "asset_types": ["stock"],
+    "timeframes": ["1d"],
+    "params": [
+        {{"id": "merge_mode", "label": "合并模式", "type": "select",
+          "options": ["union", "intersect"], "default": {merge_mode!r}}},
+        {{"id": "min_confirm", "label": "交集最少确认数", "type": "int",
+          "default": {int(min_confirm)!r}, "min": 0}},
+    ],
+    "scoring": {{}},
+    "order_by": "score",
+    "descending": True,
+    "limit": 100,
+    "children": [
+        {children_json}
+    ],
+}}
+EXECUTION_BACKEND = "composite"
+'''
+
+
+def _save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request) -> dict:
+    """保存叠加策略: 渲染声明式 .py → 写盘 → reload → 校验。"""
+    sid = _validate_strategy_id(req.strategy_id)
+    if not sid.startswith("composite_"):
+        raise ValueError("叠加策略 ID 必须以 composite_ 开头")
+
+    engine = _get_engine(request)
+    data_dir = _data_dir(request)
+
+    existing: StrategyDef | None = None
+    try:
+        existing = engine.get(sid)
+    except ValueError:
+        existing = None
+
+    if req.mode == "create":
+        if existing is not None:
+            raise ValueError(f"策略 {sid} 已存在，请改用修改模式或换一个策略 ID")
+    else:  # update
+        if existing is None:
+            raise ValueError(f"策略 {sid} 不存在")
+        if existing.source == "builtin":
+            raise ValueError("内置策略不可覆盖")
+        # 只允许覆盖 composite 策略(防止把普通策略覆盖成 composite)
+        if existing.execution_backend != "composite":
+            raise ValueError("目标策略不是叠加策略，无法以叠加模式覆盖")
+
+    if not req.children:
+        raise ValueError("叠加策略至少需要一个子策略")
+
+    children = [{"strategy_id": c.strategy_id, "weight": c.weight} for c in req.children]
+    # 子策略存在性预检(给出清晰错误, 而非等到 reload 后孤儿移除的笼统报错)。
+    for c in children:
+        try:
+            child_def = _get_public_strategy(engine, c["strategy_id"])
+        except HTTPException as exc:
+            raise ValueError(f"子策略 {c['strategy_id']!r} 不存在") from exc
+        if child_def.execution_backend == "composite":
+            raise ValueError(f"子策略 {c['strategy_id']!r} 也是叠加策略; 首版禁止嵌套叠加")
+
+    code = _render_composite_code(
+        sid, req.name, req.description, children, req.merge_mode, req.min_confirm
+    )
+
+    out_dir = _target_dir(data_dir, "composite")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{sid}.py"
+    previous_code = path.read_text(encoding="utf-8") if path.exists() else None
+    path.write_text(code, encoding="utf-8")
+
+    try:
+        engine.reload()
+        loaded = engine.get(sid)
+        if loaded.file_path is None or loaded.file_path.resolve() != path.resolve():
+            raise ValueError("策略加载到了非预期文件，请检查是否存在重复 strategy_id")
+        if loaded.source != "composite":
+            raise ValueError(f"策略来源异常: 期望 composite, 实际 {loaded.source}")
+        if loaded.execution_backend != "composite":
+            raise ValueError("策略后端异常: 期望 composite")
+    except Exception as e:
+        _restore_strategy_file(path, previous_code)
+        engine.reload()
+        raise ValueError(f"叠加策略保存失败: {e}") from e
+
+    _invalidate_strategy_runtime(request)
+
+    return {
+        "ok": True,
+        "strategy_id": sid,
+        "source": "composite",
+        "path": str(path),
+    }
+
+
+@router.post("/composite/save")
+def save_composite_strategy(req: StrategyCompositeSaveRequest, request: Request):
+    try:
+        return _save_composite_strategy(req, request)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -686,32 +1150,95 @@ async def ai_save(req: AISaveRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+@router.post("/{strategy_id}/publish")
+def publish_ai_strategy(strategy_id: str, request: Request):
+    """把 research_only 的 AI 草稿策略翻转为公开(research_only=False)。
+
+    门 = 人的显式动作: 只有 AI 来源且仍处于草稿态的策略才能被发布。
+    发布后即进入公开列表、可 run、可监控。
+    """
+    sid = _validate_strategy_id(strategy_id)
+    engine = _get_engine(request)
+    try:
+        s = engine.get(sid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=f"策略 {sid} 不存在") from e
+
+    if s.source != "ai":
+        raise HTTPException(status_code=400, detail="仅 AI 策略可经发布端点上线")
+    if not s.meta.get("research_only"):
+        raise HTTPException(status_code=400, detail="该策略已是公开状态")
+
+    path = s.file_path
+    if path is None:
+        raise HTTPException(status_code=400, detail="策略源文件路径无效, 无法发布")
+    previous_code = path.read_text(encoding="utf-8")
+    path.write_text(_set_meta_bool_field(previous_code, "research_only", False), encoding="utf-8")
+
+    try:
+        engine.reload()
+        loaded = engine.get(sid)
+        if loaded.meta.get("research_only"):
+            raise ValueError("发布后策略仍为草稿态")
+    except Exception as e:
+        _restore_strategy_file(path, previous_code)
+        engine.reload()
+        raise HTTPException(status_code=500, detail=f"策略发布失败: {e}") from e
+
+    _invalidate_strategy_runtime(request)
+    return {"ok": True, "strategy_id": sid}
+
+
 @router.delete("/{strategy_id}")
 def delete_strategy(strategy_id: str, request: Request):
-    """删除自定义策略 — 清除 .py 文件 + overrides + 热重载。内置策略不可删除。"""
+    """删除自定义策略 — 清除源文件、运行时注册和关联状态。内置策略不可删除。"""
 
     engine = _get_engine(request)
     try:
         s = engine.get(strategy_id)
-    except ValueError:
-        raise HTTPException(status_code=404, detail=f"策略 {strategy_id} 不存在")
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=f"策略 {strategy_id} 不存在") from e
 
     if s.source == "builtin":
         raise HTTPException(status_code=403, detail="内置策略不可删除")
 
-    # 删除策略文件
-    if s.file_path and s.file_path.exists():
-        s.file_path.unlink()
+    # 删除被引用的子策略会令叠加策略加载失败; 删除前 fail-closed 阻止。
+    dependents = engine.find_dependents(strategy_id)
+    if dependents:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该策略被叠加策略 {dependents} 引用，请先解除引用后再删除",
+        )
 
-    # 删除 overrides
+    path = s.file_path
     data_dir = _data_dir(request)
-    override_path = data_dir / "user_data" / "strategy_overrides" / f"{strategy_id}.json"
-    if override_path.exists():
-        override_path.unlink()
+    if path is None or s.source not in {"custom", "ai", "composite"}:
+        raise HTTPException(status_code=400, detail="策略源文件路径无效, 无法删除")
 
-    # 热重载
-    engine.reload()
-    return {"ok": True}
+    try:
+        allowed_dir = (data_dir / "strategies" / s.source).resolve()
+        resolved_path = path.resolve()
+    except (OSError, RuntimeError) as e:
+        raise HTTPException(status_code=409, detail=f"无法访问策略文件: {e}") from e
+    if not resolved_path.is_relative_to(allowed_dir):
+        raise HTTPException(status_code=400, detail="策略源文件不在用户策略目录, 拒绝删除")
+
+    try:
+        resolved_path.unlink(missing_ok=True)
+    except OSError as e:
+        reason = e.strerror or str(e)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"无法删除策略文件 {resolved_path.name}: {reason}。"
+                "请确认数据目录可写; Docker 部署请检查数据卷不是只读挂载。"
+            ),
+        ) from e
+
+    # 删除只影响当前策略, 全量 reload 会让其他损坏或重复 ID 的文件阻塞本次删除。
+    engine.unregister(strategy_id)
+    warnings = _cleanup_deleted_strategy(request, strategy_id)
+    return {"ok": True, "warnings": warnings}
 
 
 # ── 监控 ─────────────────────────────────────────────────────────────
@@ -725,5 +1252,9 @@ def delete_strategy(strategy_id: str, request: Request):
 @router.post("/reload")
 def reload_strategies(request: Request):
     engine = _get_engine(request)
-    engine.reload()
+    try:
+        engine.reload()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    _invalidate_strategy_runtime(request)
     return {"ok": True, "count": len(engine.list_strategies())}

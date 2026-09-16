@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { api, type KlineRow } from '@/lib/api'
-import { QK } from '@/lib/queryKeys'
+import { type KlineRow } from '@/lib/api'
+import { klineDailyQueryOptions } from '@/lib/kline'
+import { storage } from '@/lib/storage'
 import {
   EChartsCandlestick,
   OVERLAY_INDICATORS,
@@ -10,18 +11,18 @@ import {
   type ChartPriceLine,
   type ChartRange,
   type OHLC,
-  type StockInfo,
+  type VolumeCompareConfig,
 } from '@/components/EChartsCandlestick'
 
 const SUB_INFO_H = 16
 const SUB_GAP = 4
-const MAX_DAYS = 2000
+const DEFAULT_VOLUME_COMPARE: VolumeCompareConfig = { enabled: true, days: 1 }
 
-export interface StockDailyKChartResult {
-  rows: OHLC[]
-  rawRows: KlineRow[]
-  stockInfo?: StockInfo
-  name?: string
+function normalizeVolumeCompare(config: VolumeCompareConfig): VolumeCompareConfig {
+  return {
+    enabled: config.enabled !== false,
+    days: Math.max(1, Math.min(20, Math.round(Number(config.days) || 1))),
+  }
 }
 
 interface Props {
@@ -37,10 +38,11 @@ interface Props {
   showMarkerToggle?: boolean
   showMA?: boolean
   showInfoBar?: boolean
-  visibleBars?: number
+  /** 初始可见蜡烛根数; 'all' = 适配显示全部数据 */
+  visibleBars?: number | 'all'
   linkedPrice?: number | null
   onDateClick?: (date: string) => void
-  onDataChange?: (result: StockDailyKChartResult) => void
+  onPriceDoubleClick?: (price: number, currentPrice: number) => void
   /** 扩展数据列参数（逗号分隔 config_id.field_name），透传给 klineDaily 接口 */
   extColumns?: string
 }
@@ -100,12 +102,6 @@ export function getDefaultRange(): { start: string; end: string } {
   return { start, end }
 }
 
-function rangeDays(range: { start: string; end: string }): number {
-  const start = new Date(range.start)
-  const end = new Date(range.end)
-  return Math.min(Math.ceil((end.getTime() - start.getTime()) / 86400000) + 30, MAX_DAYS)
-}
-
 export function StockDailyKChart({
   symbol,
   height = 520,
@@ -122,21 +118,18 @@ export function StockDailyKChart({
   visibleBars = 60,
   linkedPrice,
   onDateClick,
-  onDataChange,
+  onPriceDoubleClick,
   extColumns,
 }: Props) {
   const [activeIndicators, setActiveIndicators] = useState<string[]>(['vol'])
   const [showMarkers, setShowMarkers] = useState(true)
+  const [volumeCompare, setVolumeCompare] = useState<VolumeCompareConfig>(() =>
+    normalizeVolumeCompare(storage.stockVolumeCompare.get(DEFAULT_VOLUME_COMPARE)),
+  )
   const dateRange = externalDateRange ?? getDefaultRange()
-  const days = useMemo(() => rangeDays(dateRange), [dateRange])
 
-  // extColumns 纳入 query key：勾选/取消扩展字段时需重新请求（带 ext_columns 参数）
-  const kline = useQuery({
-    queryKey: QK.kline(symbol, dateRange.start, dateRange.end, extColumns),
-    queryFn: () => api.klineDaily(symbol, days, dateRange, extColumns),
-    enabled: !!symbol,
-    placeholderData: (prev) => prev,
-  })
+  // 查询配置统一来自 klineDailyQueryOptions, 与 StockPanel 信息条/邻近预取共享同一 cache key (只发一次请求)
+  const kline = useQuery({ ...klineDailyQueryOptions(symbol, dateRange, extColumns), enabled: !!symbol })
 
   const rows = useMemo(() => toOHLC(kline.data?.rows ?? []), [kline.data?.rows])
   const stockInfo = kline.data?.stock_info
@@ -150,6 +143,14 @@ export function StockDailyKChart({
     setActiveIndicators(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key])
   }, [])
 
+  const updateVolumeCompare = useCallback((patch: Partial<VolumeCompareConfig>) => {
+    setVolumeCompare(prev => {
+      const next = normalizeVolumeCompare({ ...prev, ...patch })
+      storage.stockVolumeCompare.set(next)
+      return next
+    })
+  }, [])
+
   const activeSubDefs = activeIndicators
     .map(key => SUB_CHARTS.find(s => s.key === key))
     .filter((d): d is typeof SUB_CHARTS[number] => !!d)
@@ -157,10 +158,6 @@ export function StockDailyKChart({
   activeSubDefs.forEach(def => { subExtraH += SUB_INFO_H + def.height })
   if (activeSubDefs.length > 0) subExtraH += activeSubDefs.length * SUB_GAP + 14
   const chartHeight = height + subExtraH
-
-  useEffect(() => {
-    onDataChange?.({ rows, rawRows: kline.data?.rows ?? [], stockInfo, name: kline.data?.name })
-  }, [kline.data?.name, kline.data?.rows, onDataChange, rows, stockInfo])
 
   if (!symbol) return null
 
@@ -194,6 +191,37 @@ export function StockDailyKChart({
               {ind.label}
             </button>
           ))}
+          {activeIndicators.includes('vol') && (
+            <div className="ml-0.5 flex h-5 items-center gap-1.5 border-l border-border/70 pl-2">
+              <span className="text-[10px] text-muted">量比</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={volumeCompare.enabled}
+                aria-label="开启量能对比"
+                title={volumeCompare.enabled ? '关闭量能对比' : '开启量能对比'}
+                onClick={() => updateVolumeCompare({ enabled: !volumeCompare.enabled })}
+                className={`relative h-3.5 w-6 shrink-0 rounded-full transition-colors ${
+                  volumeCompare.enabled ? 'bg-accent' : 'bg-elevated'
+                }`}
+              >
+                <span className={`absolute left-0 top-0.5 h-2.5 w-2.5 rounded-full bg-white transition-transform ${
+                  volumeCompare.enabled ? 'translate-x-3' : 'translate-x-0.5'
+                }`} />
+              </button>
+              <select
+                aria-label="量能对比周期"
+                value={volumeCompare.days}
+                disabled={!volumeCompare.enabled}
+                onChange={event => updateVolumeCompare({ days: Number(event.target.value) })}
+                className="h-5 rounded border border-border bg-base px-1 text-[10px] text-secondary outline-none disabled:opacity-40"
+              >
+                {Array.from({ length: 20 }, (_, index) => index + 1).map(days => (
+                  <option key={days} value={days}>前{days}日均量</option>
+                ))}
+              </select>
+            </div>
+          )}
           {showMarkerToggle && showLimitMarkers && (
             <button
               onClick={() => setShowMarkers(v => !v)}
@@ -227,8 +255,10 @@ export function StockDailyKChart({
           symbol={symbol}
           linkedPrice={linkedPrice}
           onDateClick={onDateClick}
+          onPriceDoubleClick={onPriceDoubleClick}
           visibleBars={visibleBars}
           activeIndicators={activeIndicators}
+          volumeCompare={volumeCompare}
         />
       )}
     </div>

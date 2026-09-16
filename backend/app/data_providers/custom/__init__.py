@@ -1,5 +1,6 @@
 """Custom data source extension points."""
 from app.data_providers.custom.loader import (
+    create_provider,
     data_sources_dir,
     delete_config,
     errors,
@@ -12,12 +13,15 @@ from app.data_providers.custom.loader import (
     list_sources,
     load_all,
     names,
+    plugin_manifest,
+    probe_plugin_key,
     provider_has_dataset,
     save_config,
     uninstall_plugin,
 )
 
 __all__ = [
+    "create_provider",
     "data_sources_dir",
     "delete_config",
     "errors",
@@ -30,6 +34,8 @@ __all__ = [
     "list_sources",
     "load_all",
     "names",
+    "plugin_manifest",
+    "probe_plugin_key",
     "provider_has_dataset",
     "save_config",
     "uninstall_plugin",

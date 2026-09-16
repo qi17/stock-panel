@@ -1,4 +1,4 @@
-"""内置扩展数据预设 — 概念/行业首次启动自动拉取。
+"""内置扩展数据预设 — 概念/行业启动时只创建配置, 等待用户手动获取 (#199)。
 
 设计原则:
   - 扩展数据通用逻辑零改动 (ExtConfig / fetch_and_ingest / API / 前端均不动)
@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 from app.services.ext_data import (
@@ -54,14 +55,16 @@ def _concept_preset() -> ExtConfig:
             ExtField("股票简称", "string", "股票简称"),
             ExtField("所属概念", "string", "所属概念"),
         ],
-        description="同花顺概念分类 (首次启动自动拉取, 可在扩展数据页手动更新)",
+        description="同花顺概念分类 (启动仅创建配置, 在概念/行业页手动获取)",
         symbol_map={"type": "mapped", "col": "股票代码"},
         code_map={"type": "computed", "from": "symbol", "method": "strip_exchange"},
         pull=PullConfig(
             url=_CONCEPT_DATA_URL,
             method="GET",
             schedule_minutes=1440,
-            enabled=True,
+            # enabled=False: ensure_builtin_presets 承诺启动不拉取, PullScheduler
+            # 只调度 enabled 配置; 手动获取走 fetch_preset 独立路径不受影响 (#199)
+            enabled=False,
         ),
     )
 
@@ -83,14 +86,15 @@ def _industry_preset() -> ExtConfig:
             ExtField("股票简称", "string", "股票简称"),
             ExtField("所属同花顺行业", "string", "所属同花顺行业"),
         ],
-        description="同花顺行业分类 (首次启动自动拉取, 可在扩展数据页手动更新)",
+        description="同花顺行业分类 (启动仅创建配置, 在概念/行业页手动获取)",
         symbol_map={"type": "mapped", "col": "股票代码"},
         code_map={"type": "computed", "from": "symbol", "method": "strip_exchange"},
         pull=PullConfig(
             url=_INDUSTRY_DATA_URL,
             method="GET",
             schedule_minutes=1440,
-            enabled=True,
+            # 同概念 preset: 出厂禁用, 避免启动即网络拉取 (#199)
+            enabled=False,
         ),
     )
 
@@ -108,6 +112,13 @@ def _symbol_to_code(symbol: str) -> str:
     return symbol.split(".", 1)[0] if "." in symbol else symbol
 
 
+def _dimension_label(value: object) -> str:
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return ""
+    text = str(value).strip()
+    return "" if text.casefold() in {"nan", "none", "null"} else text
+
+
 def _flatten_concept_rows(raw_rows: list[dict]) -> list[dict]:
     """概念: concepts 数组 → 分号拼接成「所属概念」字符串。
 
@@ -120,10 +131,11 @@ def _flatten_concept_rows(raw_rows: list[dict]) -> list[dict]:
         if not sym:
             continue
         concepts = r.get("concepts") or []
+        labels = [label for c in concepts if (label := _dimension_label(c))]
         out.append({
             "股票代码": sym,
             "股票简称": r.get("name") or "",
-            "所属概念": ";".join(str(c) for c in concepts if c),
+            "所属概念": ";".join(labels),
             "symbol": sym,
             "code": _symbol_to_code(sym),
         })
@@ -141,10 +153,11 @@ def _flatten_industry_rows(raw_rows: list[dict]) -> list[dict]:
         if not sym:
             continue
         inds = r.get("industries") or []
+        labels = [label for i in inds if (label := _dimension_label(i))]
         out.append({
             "股票代码": sym,
             "股票简称": r.get("name") or "",
-            "所属同花顺行业": "-".join(str(i) for i in inds if i),
+            "所属同花顺行业": "-".join(labels),
             "symbol": sym,
             "code": _symbol_to_code(sym),
         })
@@ -169,8 +182,11 @@ async def _fetch_json(url: str) -> list[dict]:
     """
     import httpx
 
+    # 延迟导入避免与 ext_pull 循环依赖; 出站请求带 tsp 标识头
+    from app.services.ext_pull import outbound_headers
+
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url)
+        resp = await client.get(url, headers=outbound_headers())
         resp.raise_for_status()
         data = resp.json()
 

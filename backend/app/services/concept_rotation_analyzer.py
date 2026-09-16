@@ -18,16 +18,24 @@ from collections.abc import AsyncIterator
 logger = logging.getLogger(__name__)
 
 
+def _dim_label(kind: str) -> str:
+    """维度中文标签: concept→概念, industry→行业。供 prompt/文案动态化。"""
+    return "行业" if kind == "industry" else "概念"
+
+
 # ================================================================
 # System Prompt — 客观轮动分析 + 固定章节模板
 # ================================================================
 
-_SYSTEM_PROMPT = """你是一位专注 A 股题材轮动的研究分析师,拥有 12 年一线研究经验,擅长从概念板块的**涨幅排名矩阵**中客观识别主力资金脉络,区分机构主导的持续性主线与游资驱动的脉冲式轮动,产出一份**客观、中立、不包含任何买卖或操作建议**的轮动分析报告。
+def _build_system_prompt(kind: str = "concept") -> str:
+    """构建 system prompt(按维度动态替换"概念/行业"措辞)。"""
+    dim = _dim_label(kind)
+    return f"""你是一位专注 A 股题材轮动的研究分析师,拥有 12 年一线研究经验,擅长从{dim}板块的**涨幅排名矩阵**中客观识别主力资金脉络,区分机构主导的持续性主线与游资驱动的脉冲式轮动,产出一份**客观、中立、不包含任何买卖或操作建议**的轮动分析报告。
 
 ## 核心红线(务必遵守)
 
 - **绝对不输出**"跟踪/规避/追高/低吸/观望/操作建议"等任何交易指令或倾向性措辞
-- 你的角色是**客观陈述**各概念的轮动特征、资金属性(机构 vs 游资)、持续性特征
+- 你的角色是**客观陈述**各{dim}的轮动特征、资金属性(机构 vs 游资)、持续性特征
 - 换成"一个中立财经记者能不能写出来"——能写就保留,不能写就删除
 
 ## 输出规范
@@ -35,25 +43,25 @@ _SYSTEM_PROMPT = """你是一位专注 A 股题材轮动的研究分析师,拥�
 用 **Markdown** 格式输出,严格遵循以下结构。不要输出任何 JSON 或代码块,直接输出 Markdown 正文。
 
 ### 1. 🎯 主线研判(2-3 句)
-点名当前最核心的 1-2 条主线题材(连续多日霸榜的强势概念),用一句话概括其逻辑(政策/产业/业绩/事件驱动),并客观判断是**主升期/加速期/扩散期/见顶期**。结尾用【主线强度:强 / 中 / 弱】客观定性。
+点名当前最核心的 1-2 条主线题材(连续多日霸榜的强势{dim}),用一句话概括其逻辑(政策/产业/业绩/事件驱动),并客观判断是**主升期/加速期/扩散期/见顶期**。结尾用【主线强度:强 / 中 / 弱】客观定性。
 
 ### 2. 🆕 新晋强势
-列出排名快速跃升的概念(从榜单中后段冲进前列的),逐个给出:
-- 概念名 + 近 N 日排名变化(如 `45→20→8`)
+列出排名快速跃升的{dim}(从榜单中后段冲进前列的),逐个给出:
+- {dim}名 + 近 N 日排名变化(如 `45→20→8`)
 - 涨幅加速度(连日递增 = 趋势加强)
 - 可能的驱动逻辑(从板块属性推断,不要编造具体消息)
 - 客观判断是**主力切入**还是**消息脉冲**
 
 ### 3. 📉 退潮预警
-列出从高位明显滑落的概念(连续排名下滑或涨幅骤降),逐个给出:
-- 概念名 + 排名下滑轨迹
+列出从高位明显滑落的{dim}(连续排名下滑或涨幅骤降),逐个给出:
+- {dim}名 + 排名下滑轨迹
 - 退潮性质(高位分歧/资金撤离/补跌)
 - 是否扩散风险
 
 ### 4. 🏛️ 机构主线 vs 🎰 游资轮动
 基于排名稳定性客观区分两类资金行为:
-- **机构主线**:排名标准差小、长期稳居前列的概念 → 持续性特征描述
-- **游资轮动**:排名剧烈波动、脉冲式冲高的概念 → 短线波动特征描述
+- **机构主线**:排名标准差小、长期稳居前列的{dim} → 持续性特征描述
+- **游资轮动**:排名剧烈波动、脉冲式冲高的{dim} → 短线波动特征描述
 客观给出当前市场**整体轮动节奏**(快轮动/慢轮动/主线聚焦)的判断。
 
 ### 5. 🌐 结合大盘
@@ -62,10 +70,10 @@ _SYSTEM_PROMPT = """你是一位专注 A 股题材轮动的研究分析师,拥�
 - 情绪温度与轮动节奏的匹配度(如情绪冰点但题材活跃 = 抱团;情绪火热但轮动快 = 末段)
 
 ### 6. 📌 后续观察清单
-- **持续性强(客观特征)**:排名标准差小、多日稳居前列的概念(列出名称+排名数据)
-- **波动性大(客观特征)**:排名剧烈跳动的概念(列出名称+排名数据)
-- 客观描述各概念的轮动特征,供读者自行观察
-- **不输出**"跟踪/规避/追高/低吸/观望"等操作指令;可客观描述结构变化信号(如"主线概念连续 2 日跌出前 10,主线强度可能减弱")
+- **持续性强(客观特征)**:排名标准差小、多日稳居前列的{dim}(列出名称+排名数据)
+- **波动性大(客观特征)**:排名剧烈跳动的{dim}(列出名称+排名数据)
+- 客观描述各{dim}的轮动特征,供读者自行观察
+- **不输出**"跟踪/规避/追高/低吸/观望"等操作指令;可客观描述结构变化信号(如"主线{dim}连续 2 日跌出前 10,主线强度可能减弱")
 
 ### 7. ⚠️ 风险提示
 列出需要客观关注的风险(如主线断层、情绪与轮动背离、成交萎缩)。末尾附一行:
@@ -81,7 +89,7 @@ _SYSTEM_PROMPT = """你是一位专注 A 股题材轮动的研究分析师,拥�
 5. **不输出操作指令**:不写"跟踪/规避/追高/低吸/观望"等任何交易指令;客观陈述轮动特征即可。
 6. **客观推断**:若无明确消息,从量价异动客观推断可能逻辑并给结论,不要标注"[推断]"或编造具体新闻。
 
-现在请基于下方概念轮动数据进行分析。"""
+现在请基于下方{dim}轮动数据进行分析。"""
 
 
 # ================================================================
@@ -117,13 +125,11 @@ def _compute_rotation_signals(dates: list[str], columns: dict) -> dict:
     dates_asc = list(reversed(dates))
 
     # 收集每个概念在各日期的 (排名, 涨幅)。排名 = 该日在列中的索引 + 1。
-    concept_data: dict[str, list[tuple[int, float]]] = {}
+    concept_data: dict[str, dict[str, tuple[int, float]]] = {}
     for d in dates_asc:
         col = columns.get(d) or []
         for idx, (name, pct) in enumerate(col):
-            concept_data.setdefault(name, []).append((idx + 1, pct))
-
-    n_dates = len(dates_asc)
+            concept_data.setdefault(name, {})[d] = (idx + 1, pct)
 
     def _stats(ranks_pcts: list[tuple[int, float]]) -> dict:
         ranks = [r for r, _ in ranks_pcts]
@@ -143,10 +149,10 @@ def _compute_rotation_signals(dates: list[str], columns: dict) -> dict:
     institutional: list[dict] = []
     hot_money: list[dict] = []
 
-    for concept, rp in concept_data.items():
-        # 缺失日补 (大排名, 0 涨幅) 保持时间轴对齐
-        if len(rp) < n_dates:
-            rp = rp + [(999, 0.0)] * (n_dates - len(rp))
+    for concept, by_date in concept_data.items():
+        # 缺失日按日期归位补 (大排名, 0 涨幅) —— 补位必须落在缺席的那一天,
+        # 一律追加到末尾会把"只在最近几日上榜"的新晋概念读成退潮。
+        rp = [by_date.get(d, (999, 0.0)) for d in dates_asc]
         s = _stats(rp)
         s["concept"] = concept
 
@@ -200,9 +206,22 @@ def _compute_rotation_signals(dates: list[str], columns: dict) -> dict:
 # ================================================================
 
 def _fmt_pct(v) -> str:
+    """概念/行业涨幅: 小数口径 (0.0522 = +5.22%), 展示前乘 100。"""
     if v is None:
         return "—"
     return f"{v*100:+.2f}%"
+
+
+def _fmt_index_pct(v) -> str:
+    """指数涨跌幅: 百分数口径 (CONTRIBUTING §3.1), 直接展示, 不能再乘一次 100。
+
+    build_market_overview 的 indices[].change_pct 在数据边界已转成百分数
+    (quote_service._build_index_quotes 与 _index_quotes 的 DB 兜底都已乘过 100),
+    与 market_recap._build_indices_block 的展示口径一致。
+    """
+    if v is None:
+        return "—"
+    return f"{v:+.2f}%"
 
 
 def _build_market_block(overview: dict) -> str:
@@ -216,7 +235,7 @@ def _build_market_block(overview: dict) -> str:
     for idx in indices[:4]:
         name = idx.get("name") or idx.get("symbol") or "?"
         chg = idx.get("change_pct")
-        idx_lines.append(f"{name} {_fmt_pct(chg)}")
+        idx_lines.append(f"{name} {_fmt_index_pct(chg)}")
     idx_str = " / ".join(idx_lines) or "指数缺失"
 
     total_amount = (amt.get("total") or 0) / 1e8  # 元 → 亿
@@ -245,13 +264,14 @@ def _build_signal_block(title: str, items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_user_prompt(signals: dict, overview: dict, days: int, dates: list[str], focus: str) -> str:
+def _build_user_prompt(signals: dict, overview: dict, days: int, dates: list[str], focus: str, kind: str = "concept") -> str:
     """组装 user 消息: 大盘背景 + 轮动信号 + focus。"""
+    dim = _dim_label(kind)
     dates_asc = list(reversed(dates))
     date_range = f"{dates_asc[0]} ~ {dates_asc[-1]}" if dates_asc else "—"
 
     parts = [
-        f"# 概念涨幅轮动数据 (最近 {days} 个交易日: {date_range})",
+        f"# {dim}涨幅轮动数据 (最近 {days} 个交易日: {date_range})",
         "",
         "## 大盘背景",
         _build_market_block(overview),
@@ -269,10 +289,10 @@ def _build_user_prompt(signals: dict, overview: dict, days: int, dates: list[str
         _build_signal_block("🎰 游资特征 (排名波动大)", signals.get("hot_money", [])),
     ]
 
-    from app.services.ai_provider import sanitize_focus
-    safe_focus = sanitize_focus(focus)
-    if safe_focus:
-        parts.extend(["", f"本次分析请特别关注: {safe_focus}"])
+    from app.services.ai_provider import build_focus_instruction
+    focus_instruction = build_focus_instruction(focus, report_name=f"{dim}轮动分析报告")
+    if focus_instruction:
+        parts.extend(["", focus_instruction])
 
     return "\n".join(parts)
 
@@ -296,27 +316,34 @@ async def analyze_rotation_stream(
     focus: str = "",
     quote_service=None,
     depth_service=None,
+    kind: str = "concept",
+    level: int | None = None,
 ) -> AsyncIterator[str]:
-    """流式概念轮动分析: yield 出每个 NDJSON 事件。
+    """流式维度轮动分析(概念或行业): yield 出每个 NDJSON 事件。
 
     Args:
         repo: KlineRepository (必填)。
         days: 分析最近 N 个交易日 (7-30)。
         focus: 用户追加的关注点。
         quote_service / depth_service: 可选, 大盘背景装配依赖。
+        kind: "concept"(概念) 或 "industry"(行业)。
+        level: 行业层级(1/2/3), 仅 kind=industry 有效。
     """
     from app.services.rps_rotation import build_rps_rotation
     from app.services.market_overview_builder import build_market_overview
 
+    dim = _dim_label(kind)
+    page = "行业分析" if kind == "industry" else "概念分析"
+
     # 1. 取轮动矩阵
-    rotation = build_rps_rotation(repo, days)
+    rotation = build_rps_rotation(repo, days, kind, level)
     dates = rotation.get("dates") or []
     columns = rotation.get("columns") or {}
 
     if not dates or not columns:
         yield json.dumps({
             "type": "error",
-            "message": "暂无概念轮动数据,请先在「概念分析」页获取概念数据源",
+            "message": f"暂无{dim}轮动数据,请先在「{page}」页获取{dim}数据源",
         }, ensure_ascii=False)
         return
 
@@ -348,19 +375,28 @@ async def analyze_rotation_stream(
             }, ensure_ascii=False)
             return
 
-        user_prompt = _build_user_prompt(signals, overview, days, dates, focus)
+        user_prompt = _build_user_prompt(signals, overview, days, dates, focus, kind)
+        got_content = False
         async for delta in stream_ai_text(
             [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": _build_system_prompt(kind)},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.5,
-            max_tokens=4000,
+            # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
+            max_tokens=None,
+            prefer_final_answer=True,
         ):
+            got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 
     except Exception as e:  # noqa: BLE001
-        logger.exception("AI concept rotation analyze failed: %s", e)
+        logger.exception("AI %s rotation analyze failed: %s", kind, e)
         yield json.dumps({"type": "error", "message": f"AI 轮动分析失败: {e}"}, ensure_ascii=False)
+        return
 
+    if not got_content:
+        logger.warning("AI %s rotation analyze ended with empty content", kind)
+        yield json.dumps({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"}, ensure_ascii=False)
+        return
     yield json.dumps({"type": "done"}, ensure_ascii=False)

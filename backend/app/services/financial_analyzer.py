@@ -1,6 +1,6 @@
 """AI 财务分析服务 — 读取个股财务数据 → 构建专业提示词 → 流式调用 LLM。
 
-职责: 拉取单只标的的 4 张财务表 → 转成紧凑 JSON → 拼装 CFA 分析师级系统提示词
+职责: 拉取单只标的的财务报表与股本表 → 转成紧凑 JSON → 拼装 CFA 分析师级系统提示词
        → 流式调用 OpenAI 兼容 API → 逐 chunk 吐给前端。
 
 不知道: HTTP、前端、配置持久化。
@@ -14,7 +14,7 @@ from typing import AsyncIterator
 
 import polars as pl
 
-from app.services.financial_sync import get_financial_df
+from app.services.financial_sync import FINANCIAL_TABLES, get_financial_df
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +23,12 @@ _MAX_PERIODS = 4
 
 
 def _load_stock_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]:
-    """读取该标的的 4 张财务表,返回 {table: [records...]}(按 period_end 降序,截取最新 N 期)。
+    """读取该标的财务数据,返回 {table: [records...]}(按 period_end 降序,截取最新 N 期)。
 
     数值统一做 NaN/Inf → null 清洗,保证 JSON 序列化不报错。
     """
     result: dict[str, list[dict]] = {}
-    for table in ("metrics", "income", "balance_sheet", "cash_flow"):
+    for table in FINANCIAL_TABLES:
         df = get_financial_df(data_dir, table)
         if df.is_empty():
             result[table] = []
@@ -60,7 +60,7 @@ def _load_stock_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]
 def _summarize(fins: dict[str, list[dict]]) -> str:
     """生成一行业务摘要,便于 LLM 快速把握数据全貌(行数/期数)。"""
     parts = []
-    for table in ("metrics", "income", "balance_sheet", "cash_flow"):
+    for table in FINANCIAL_TABLES:
         rows = fins.get(table, [])
         if rows:
             periods = [r.get("period_end") for r in rows if r.get("period_end")]
@@ -136,13 +136,10 @@ def _build_user_prompt(fins: dict[str, list[dict]], symbol: str, focus: str) -> 
         data_json,
         "```",
     ]
-    from app.services.ai_provider import sanitize_focus
-    safe_focus = sanitize_focus(focus)
-    if safe_focus:
-        lines.extend([
-            "",
-            f"本次分析请特别关注: {safe_focus}",
-        ])
+    from app.services.ai_provider import build_focus_instruction
+    focus_instruction = build_focus_instruction(focus, report_name="财务分析报告")
+    if focus_instruction:
+        lines.extend(["", focus_instruction])
     return "\n".join(lines)
 
 
@@ -178,14 +175,18 @@ async def analyze_financials_stream(
         from app.services.ai_provider import stream_ai_text
 
         user_prompt = _build_user_prompt(fins, symbol, focus)
+        got_content = False
         async for delta in stream_ai_text(
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.4,
-            max_tokens=4000,
+            # 不限制输出(推理模型思考 token 计入预算, 见 ai_provider.stream_ai_text)
+            max_tokens=None,
+            prefer_final_answer=True,
         ):
+            got_content = True
             yield json.dumps({"type": "delta", "content": delta}, ensure_ascii=False)
 
     except Exception as e:  # noqa: BLE001
@@ -193,4 +194,8 @@ async def analyze_financials_stream(
         yield json.dumps({"type": "error", "message": f"AI 分析失败: {e}"}, ensure_ascii=False)
         return
 
+    if not got_content:
+        logger.warning("AI financial analysis ended with empty content for %s", symbol)
+        yield json.dumps({"type": "error", "message": "AI 未返回正文(输出被截断), 请重试"}, ensure_ascii=False)
+        return
     yield json.dumps({"type": "done"}, ensure_ascii=False)

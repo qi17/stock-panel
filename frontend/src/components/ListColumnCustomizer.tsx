@@ -6,7 +6,7 @@
  * - 下半区「内置列」：按业务分组折叠
  * - 底部「扩展数据列」：复用 ext_data schema，按需添加字段
  */
-import React, { useState, useCallback, useEffect, useMemo } from 'react'
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   DndContext, closestCenter, KeyboardSensor, PointerSensor,
@@ -23,6 +23,7 @@ import { useQuery } from '@tanstack/react-query'
 import { QK } from '@/lib/queryKeys'
 import type { ColumnConfig, ColumnGroup, ExtColumnDisplayConfig, CandleColumnConfig, IntradayColumnConfig } from '@/lib/list-columns'
 import { resolveCandleConfig, resolveIntradayConfig } from '@/lib/list-columns'
+import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 
 interface ListColumnCustomizerProps {
   columns: ColumnConfig[]
@@ -38,7 +39,30 @@ interface ListColumnCustomizerProps {
   showExtColumns?: boolean
   /** 是否显示「单独显示」勾选项（默认 false；仅信息条场景启用，让某列独占一行）。 */
   showStandaloneToggle?: boolean
+  /**
+   * 是否禁用遮罩背景模糊 (backdrop-blur)。默认 false。
+   * 信息条场景 (宿主含 Canvas K线/分时图) 传 true：blur 会对 Canvas 做逐帧 GPU 合成，
+   * 是抽屉打开/滑动卡顿的主因；改纯半透明遮罩后合成层锐减。
+   * 选股/自选页背后是 DOM 表格，blur 开销可忽略，保持默认。
+   */
+  disableBackdropBlur?: boolean
 }
+
+/** 判断扩展数据字段类型是否为数字(int/float/double/number/decimal 等)。
+ * 旧列 source 无 fieldType 时默认 true(放宽), 让旧列也能配置数字格式 ——
+ * 若列实际非数字, 渲染时 typeof val==='number' 判断会跳过格式化, 无副作用。 */
+function isNumericFieldType(ft?: string): boolean {
+  if (!ft) return true
+  const t = ft.toLowerCase()
+  // 明确是文本类则不显示
+  if (['str', 'string', 'text', 'char', 'varchar', 'date', 'time', 'bool', 'boolean'].some(k => t.includes(k))) {
+    return false
+  }
+  return true
+}
+
+/** 模块级空数组常量：extSchema 未加载时用，避免 `?? []` 每次创建新引用导致 useMemo 失效。 */
+const EMPTY_EXT_TABLES: readonly { id: string; label: string; mode: string; columns: { name: string; label: string; type: string }[] }[] = []
 
 function SortableActiveCol({ col, onRemove, onConfig, configOpen, extTableLabel, extConfig, candleConfig: candlePanel, intradayConfig: intradayPanel, strategiesConfig, showStandaloneToggle, onToggleStandalone }: {
   col: ColumnConfig
@@ -46,10 +70,10 @@ function SortableActiveCol({ col, onRemove, onConfig, configOpen, extTableLabel,
   onConfig: (id: string | null) => void
   configOpen: boolean
   extTableLabel: string
-  extConfig: React.ReactNode
-  candleConfig: React.ReactNode
-  intradayConfig: React.ReactNode
-  strategiesConfig: React.ReactNode
+  extConfig: () => React.ReactNode
+  candleConfig: () => React.ReactNode
+  intradayConfig: () => React.ReactNode
+  strategiesConfig: () => React.ReactNode
   showStandaloneToggle?: boolean
   onToggleStandalone?: (id: string) => void
 }) {
@@ -118,7 +142,7 @@ function SortableActiveCol({ col, onRemove, onConfig, configOpen, extTableLabel,
           <EyeOff className="h-3 w-3" />
         </button>
       </div>
-      {hasConfig && configOpen && (isExt ? extConfig : isCandle ? candlePanel : isIntraday ? intradayPanel : strategiesConfig)}
+      {hasConfig && configOpen && (isExt ? extConfig() : isCandle ? candlePanel() : isIntraday ? intradayPanel() : strategiesConfig())}
     </>
   )
 }
@@ -135,6 +159,7 @@ export function ListColumnCustomizer({
   extFieldFilter,
   showExtColumns = true,
   showStandaloneToggle = false,
+  disableBackdropBlur = false,
 }: ListColumnCustomizerProps) {
   const extSchema = useQuery({
     queryKey: QK.extDataSchemaAll,
@@ -142,6 +167,15 @@ export function ListColumnCustomizer({
     enabled: open && showExtColumns,
     staleTime: 60_000,
   })
+  const backdrop = useDialogBackdrop(onClose)
+
+  // columns/onChange 用 ref 镜像，让下方多数 useCallback 空依赖（addExtColumn 例外，
+  // 依赖 props.extColumnAlign）。callback 引用稳定后，columns 变更不再导致
+  // SortableActiveCol 等子组件因 props 变化而无谓重渲染。
+  const columnsRef = useRef(columns)
+  columnsRef.current = columns
+  const onChangeRef = useRef(onChange)
+  onChangeRef.current = onChange
 
   const [searchQuery, setSearchQuery] = useState('')
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
@@ -160,16 +194,18 @@ export function ListColumnCustomizer({
   const activeCols = useMemo(() => columns.filter(c => !c.pinned && c.visible), [columns])
 
   const toggleVisible = useCallback((colId: string) => {
-    onChange(columns.map(c =>
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c =>
       c.id === colId && !c.pinned ? { ...c, visible: !c.visible } : c
     ))
-  }, [columns, onChange])
+  }, [])
 
   const toggleStandalone = useCallback((colId: string) => {
-    onChange(columns.map(c =>
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c =>
       c.id === colId ? { ...c, standalone: !c.standalone } : c
     ))
-  }, [columns, onChange])
+  }, [])
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -179,87 +215,96 @@ export function ListColumnCustomizer({
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     const { active, over } = event
     if (!over || active.id === over.id) return
-    const reorderCols = columns.filter(c => !c.pinned)
-    const pinnedCols = columns.filter(c => c.pinned)
+    const cols = columnsRef.current
+    const reorderCols = cols.filter(c => !c.pinned)
+    const pinnedCols = cols.filter(c => c.pinned)
     const ids = reorderCols.map(c => c.id)
     const oldIdx = ids.indexOf(active.id as string)
     const newIdx = ids.indexOf(over.id as string)
     if (oldIdx < 0 || newIdx < 0) return
     const reordered = arrayMove(reorderCols, oldIdx, newIdx)
-    onChange([...pinnedCols, ...reordered])
-  }, [columns, onChange])
+    onChangeRef.current([...pinnedCols, ...reordered])
+  }, [])
 
-  const addExtColumn = useCallback((configId: string, fieldName: string, fieldLabel?: string) => {
+  const addExtColumn = useCallback((configId: string, fieldName: string, fieldLabel?: string, fieldType?: string) => {
+    const cols = columnsRef.current
     const colId = `ext:${configId}:${fieldName}`
-    if (columns.some(c => c.id === colId)) {
+    if (cols.some(c => c.id === colId)) {
       toggleVisible(colId)
       return
     }
     const newCol: ColumnConfig = {
       id: colId,
-      source: { type: 'ext', configId, fieldName, fieldLabel },
+      source: { type: 'ext', configId, fieldName, fieldLabel, fieldType },
       label: fieldLabel || fieldName,
       visible: true,
       align: extColumnAlign,
     }
-    const actionIdx = columns.findIndex(c => c.id === 'builtin:action')
+    const actionIdx = cols.findIndex(c => c.id === 'builtin:action')
     if (actionIdx >= 0) {
-      const next = [...columns]
+      const next = [...cols]
       next.splice(actionIdx, 0, newCol)
-      onChange(next)
+      onChangeRef.current(next)
     } else {
-      onChange([...columns, newCol])
+      onChangeRef.current([...cols, newCol])
     }
-  }, [columns, extColumnAlign, onChange, toggleVisible])
+  }, [extColumnAlign, toggleVisible])
 
   const hideColumn = useCallback((colId: string) => {
-    onChange(columns.map(c => c.id === colId ? { ...c, visible: false } : c))
-  }, [columns, onChange])
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c => c.id === colId ? { ...c, visible: false } : c))
+  }, [])
 
   const updateExtDisplay = useCallback((colId: string, patch: Partial<ExtColumnDisplayConfig>) => {
-    onChange(columns.map(c => {
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c => {
       if (c.id !== colId) return c
       return { ...c, extDisplay: { displayMode: 'tag', ...(c.extDisplay || {}), ...patch } }
     }))
-  }, [columns, onChange])
+  }, [])
 
   const resetExtDisplay = useCallback((colId: string) => {
-    onChange(columns.map(c => {
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c => {
       if (c.id !== colId) return c
       const { extDisplay, ...rest } = c
       return rest
     }))
-  }, [columns, onChange])
+  }, [])
 
   const updateCandleConfig = useCallback((colId: string, patch: Partial<CandleColumnConfig>) => {
-    onChange(columns.map(c => {
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c => {
       if (c.id !== colId) return c
       return { ...c, candleConfig: { ...c.candleConfig, ...patch } }
     }))
-  }, [columns, onChange])
+  }, [])
 
   const resetCandleConfig = useCallback((colId: string) => {
-    onChange(columns.map(c => {
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c => {
       if (c.id !== colId) return c
       const { candleConfig, ...rest } = c
       return rest
     }))
-  }, [columns, onChange])
+  }, [])
 
   const updateIntradayConfig = useCallback((colId: string, patch: Partial<IntradayColumnConfig>) => {
-    onChange(columns.map(c => {
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c => {
       if (c.id !== colId) return c
       return { ...c, intradayConfig: { ...c.intradayConfig, ...patch } }
     }))
-  }, [columns, onChange])
+  }, [])
 
   const resetIntradayConfig = useCallback((colId: string) => {
-    onChange(columns.map(c => {
+    const cols = columnsRef.current
+    onChangeRef.current(cols.map(c => {
       if (c.id !== colId) return c
       const { intradayConfig, ...rest } = c
       return rest
     }))
-  }, [columns, onChange])
+  }, [])
 
   const toggleGroup = useCallback((groupId: string) => {
     setExpandedGroups(prev => {
@@ -279,8 +324,8 @@ export function ListColumnCustomizer({
     })
   }, [])
 
-  const extTables = extSchema.data?.items ?? []
-  const extTableLabelMap = new Map(extTables.map(t => [t.id, t.label]))
+  const extTables = extSchema.data?.items ?? EMPTY_EXT_TABLES
+  const extTableLabelMap = useMemo(() => new Map(extTables.map(t => [t.id, t.label])), [extTables])
 
   const query = searchQuery.trim().toLowerCase()
   const filteredGroups = useMemo(() => {
@@ -405,6 +450,53 @@ export function ListColumnCustomizer({
               >竖向</button>
             </div>
           </label>
+        )}
+        {/* 数字格式化配置: 千分位 + 单位换算 + 小数位(仅 number 类型字段) */}
+        {col.source.type === 'ext' && isNumericFieldType(col.source.fieldType) && (
+          <>
+            <div className="border-t border-border/40 pt-2 mt-1 text-[10px] text-muted">数字格式</div>
+            <label className="flex items-center gap-2 text-xs">
+              <span className="text-secondary w-16 shrink-0">千分位</span>
+              <button
+                type="button"
+                onClick={() => updateExtDisplay(col.id, { thousandSeparator: !col.extDisplay?.thousandSeparator })}
+                className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors duration-200 cursor-pointer ${
+                  col.extDisplay?.thousandSeparator ? 'bg-accent' : 'bg-elevated'
+                }`}
+                aria-pressed={!!col.extDisplay?.thousandSeparator}
+              >
+                <span className={`inline-block h-3 w-3 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                  col.extDisplay?.thousandSeparator ? 'translate-x-[14px]' : 'translate-x-0.5'
+                }`} />
+              </button>
+              <span className="text-[10px] text-muted">如 1,234,567</span>
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <span className="text-secondary w-16 shrink-0">单位换算</span>
+              <select
+                value={col.extDisplay?.unitConvert ?? 'none'}
+                onChange={e => updateExtDisplay(col.id, { unitConvert: e.target.value as 'none' | 'wan' | 'yi' | 'auto' })}
+                className="flex-1 h-7 rounded bg-elevated border border-border text-foreground text-xs px-2 focus:outline-none focus:border-accent/50"
+              >
+                <option value="none">不换算</option>
+                <option value="wan">万 (÷1万)</option>
+                <option value="yi">亿 (÷1亿)</option>
+                <option value="auto">自动 (≥亿用亿, ≥万用万)</option>
+              </select>
+            </label>
+            {(col.extDisplay?.unitConvert ?? 'none') !== 'none' && (
+              <label className="flex items-center gap-2 text-xs">
+                <span className="text-secondary w-16 shrink-0">小数位</span>
+                <input
+                  type="number" min={0} max={6} step={1}
+                  value={col.extDisplay?.unitDecimals ?? 2}
+                  onChange={e => updateExtDisplay(col.id, { unitDecimals: Math.max(0, Math.min(6, Number(e.target.value) || 0)) })}
+                  className="w-16 h-7 rounded bg-elevated border border-border text-foreground text-xs px-2 text-center focus:outline-none focus:border-accent/50"
+                />
+                <span className="text-[10px] text-muted">换算后保留几位</span>
+              </label>
+            )}
+          </>
         )}
         {col.extDisplay && (
           <div className="flex justify-end pt-1">
@@ -643,7 +735,7 @@ export function ListColumnCustomizer({
     return (
       <button
         key={field.name}
-        onClick={() => addExtColumn(configId, field.name, field.label)}
+        onClick={() => addExtColumn(configId, field.name, field.label, field.type)}
         className="flex items-center gap-2 w-full px-2 py-1.5 rounded hover:bg-elevated/50 text-left group transition-colors"
       >
         {renderCheckbox(checked)}
@@ -660,8 +752,8 @@ export function ListColumnCustomizer({
           <motion.div
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
             transition={{ duration: 0.15 }}
-            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
-            onClick={onClose}
+            className={`absolute inset-0 bg-black/50 ${disableBackdropBlur ? '' : 'backdrop-blur-sm'}`}
+            {...backdrop}
           />
           <motion.div
             initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }}
@@ -706,10 +798,10 @@ export function ListColumnCustomizer({
                           onConfig={setConfigOpenId}
                           configOpen={configOpenId === col.id}
                           extTableLabel={col.source.type === 'ext' ? (extTableLabelMap.get(col.source.configId) || col.source.configId) : ''}
-                          extConfig={renderExtConfig(col)}
-                          candleConfig={renderCandleConfig(col)}
-                          intradayConfig={renderIntradayConfig(col)}
-                          strategiesConfig={renderStrategiesConfig(col)}
+                          extConfig={() => renderExtConfig(col)}
+                          candleConfig={() => renderCandleConfig(col)}
+                          intradayConfig={() => renderIntradayConfig(col)}
+                          strategiesConfig={() => renderStrategiesConfig(col)}
                           showStandaloneToggle={showStandaloneToggle}
                           onToggleStandalone={toggleStandalone}
                         />

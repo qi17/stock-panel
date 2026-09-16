@@ -1,12 +1,14 @@
 ﻿import { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { X, Settings2, RotateCcw, Save, ChevronDown, Filter, Star, TrendingUp, Sparkles, Download } from 'lucide-react'
-import { api, type StrategyDetail, type StrategyParamDef } from '@/lib/api'
+import { X, Settings2, RotateCcw, Save, ChevronDown, Filter, Star, TrendingUp, Sparkles, Download, Layers, Plus, Trash2 } from 'lucide-react'
+import { api, type StrategyDetail, type StrategyParamDef, type CompositeChildInfo, type ScoringDirection } from '@/lib/api'
+import { toPercentages, normalizeWeights } from '@/lib/weights'
 import { BUILTIN_COLUMNS } from '@/lib/watchlist-columns'
 import { color } from '@/lib/colors'
 import { SignalPicker } from './SignalPicker'
 import { SignalTriggerActions } from '@/components/signals/SignalTriggerActions'
 import { Modal } from '@/components/Modal'
+import { ScoringEditor } from '@/components/ScoringEditor'
 
 // 内置列名 → 中文标签
 const FIELD_LABEL: Record<string, string> = {}
@@ -21,6 +23,7 @@ Object.assign(FIELD_LABEL, {
   vol_ratio_5d: '量比', vol_ratio_20d: '20日量比',
   macd_dif: 'MACD-DIF', macd_dea: 'MACD-DEA', macd_hist: 'MACD柱',
   boll_upper: '布林上轨', boll_lower: '布林下轨',
+  ma20_bias: 'MA20乖离率',
 })
 
 interface Props {
@@ -172,31 +175,6 @@ function ParamField({ def, value, onChange }: {
   )
 }
 
-// 评分权重字段
-function ScoringField({ col, weight, pct, editing, onChange }: {
-  col: string; weight: number; pct: number; editing: boolean; onChange: (v: number) => void
-}) {
-  return (
-    <div className="flex items-center gap-2">
-      <span className="text-[11px] text-secondary w-16 shrink-0 text-right">{FIELD_LABEL[col] ?? col}</span>
-      {editing ? (
-        <input
-          type="range"
-          value={weight}
-          onChange={e => onChange(Number(e.target.value))}
-          min={0} max={100} step={1}
-          className="flex-1 h-1 accent-amber-400 cursor-pointer"
-        />
-      ) : (
-        <div className="flex-1 h-1.5 bg-elevated rounded-full overflow-hidden">
-          <div className="h-full bg-amber-400/70 rounded-full transition-all duration-300" style={{ width: `${Math.min(pct, 100)}%` }} />
-        </div>
-      )}
-      <span className="w-10 text-right text-[10px] font-mono text-muted">{editing ? weight : `${pct}%`}</span>
-    </div>
-  )
-}
-
 export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModify, onDeleted }: Props) {
   const [detail, setDetail] = useState<StrategyDetail | null>(null)
   const [loading, setLoading] = useState(false)
@@ -209,13 +187,20 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
   const [basicFilter, setBasicFilter] = useState<Record<string, any>>({})
   const [params, setParams] = useState<Record<string, any>>({})
   const [scoring, setScoring] = useState<Record<string, number>>({})
+  const [scoringDirections, setScoringDirections] = useState<Record<string, ScoringDirection>>({})
   const [stopLoss, setStopLoss] = useState<number | null>(null)
   const [maxHoldDays, setMaxHoldDays] = useState<number | null>(null)
   const [entrySignals, setEntrySignals] = useState<string[]>([])
   const [exitSignals, setExitSignals] = useState<string[]>([])
   const [displayLimit, setDisplayLimit] = useState<number | null>(null)
   const [basicFilterEnabled, setBasicFilterEnabled] = useState(true)
-  const [editingScoring, setEditingScoring] = useState(false)
+  // 叠加策略: 子策略列表与权重(composite 专属, 编辑权重后随 override 保存)
+  const [compositeChildren, setCompositeChildren] = useState<CompositeChildInfo[]>([])
+  // 点击子策略名打开其配置编辑(composite 专属; 子策略必非 composite, 不会再嵌套)
+  const [editingChildId, setEditingChildId] = useState<string | null>(null)
+  // 可选子策略列表 + 添加面板开关(composite 设置用)
+  const [allStrategies, setAllStrategies] = useState<{ id: string; name: string; source?: string }[]>([])
+  const [showAddChild, setShowAddChild] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleteError, setDeleteError] = useState('')
@@ -228,6 +213,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
   // 加载策略详情
   useEffect(() => {
     if (!strategyId) return
+    setEditingChildId(null)
     setLoading(true)
     api.strategyGet(strategyId)
       .then(d => {
@@ -239,17 +225,41 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
         if (!bf.boards) bf.boards = ALL_BOARDS
         setBasicFilter(bf)
         setParams(d.params_defaults)
-        setScoring(Object.fromEntries(Object.entries(d.scoring).map(([k, v]) => [k, Math.round((v as number) * 100)])))
+        setScoring(d.scoring)
+        setScoringDirections(d.scoring_directions ?? {})
         setStopLoss(d.stop_loss)
         setMaxHoldDays(d.max_hold_days)
         setEntrySignals(d.entry_signals ?? [])
         setExitSignals(d.exit_signals ?? [])
         setDisplayLimit(d.display_limit ?? null)
         setBasicFilterEnabled(d.basic_filter?.enabled !== false)
+        setCompositeChildren((() => {
+          // 存储的小数权重 → 滑块百分比口径
+          const list = d.composite_children ?? []
+          const pcts = toPercentages(list.map(c => c.weight))
+          return list.map((c, i) => ({ ...c, weight: pcts[i] }))
+        })())
+        // composite 策略: 加载全部可选子策略(排除自身和其他 composite)供添加
+        if (d.source === 'composite') {
+          api.screenerStrategies().then(data => {
+            setAllStrategies((data.presets ?? []).filter(s => s.id !== strategyId && s.source !== 'composite'))
+          }).catch(() => setAllStrategies([]))
+        }
       })
       .catch(() => setDetail(null))
       .finally(() => setLoading(false))
   }, [strategyId])
+
+  // 叠加策略: 滑块百分比口径, 允许总和 ≠100, 保存时自动按比例归一
+  const compositeTotal = compositeChildren.reduce((s, c) => s + (c.weight || 0), 0)
+  const removeCompositeChild = (id: string) => {
+    setCompositeChildren(prev => prev.filter(c => c.id !== id))
+  }
+  const addCompositeChild = (s: { id: string; name: string; source?: string }) => {
+    // 首个子策略独占 100%, 后续默认 10% (与因子编辑口径一致)
+    setCompositeChildren(prev => [...prev, { id: s.id, name: s.name, source: s.source ?? '', weight: prev.length === 0 ? 100 : 10 }])
+    setShowAddChild(false)
+  }
 
   // 保存
   const handleSave = async () => {
@@ -261,12 +271,24 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
         description: strategyDesc,
         basic_filter: { ...basicFilter, enabled: basicFilterEnabled },
         params,
-        scoring: Object.fromEntries(Object.entries(scoring).map(([k, v]) => [k, +(v / 100).toFixed(4)])),
+        ...(detail?.source !== 'composite' ? {
+          scoring,
+          scoring_directions: scoringDirections,
+          scoring_replace: true,
+        } : {}),
         stop_loss: stopLoss,
         max_hold_days: maxHoldDays,
         entry_signals: entrySignals,
         exit_signals: exitSignals,
         display_limit: displayLimit,
+        // 叠加策略: 子策略权重(composite 专属, 走 override.children 持久化)
+        ...(detail?.source === 'composite'
+          ? { children: (() => {
+              // 滑块百分比 → 归一小数权重再持久化
+              const normalized = normalizeWeights(compositeChildren.map(c => c.weight))
+              return compositeChildren.map((c, i) => ({ strategy_id: c.id, weight: normalized[i] }))
+            })() }
+          : {}),
       })
       onSaved?.(displayLimit)
       onClose()
@@ -290,16 +312,18 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
       if (!bf.boards) bf.boards = ALL_BOARDS
       setBasicFilter(bf)
       setParams(d.params_defaults)
-      setScoring(Object.fromEntries(Object.entries(d.scoring).map(([k, v]) => [k, Math.round((v as number) * 100)])))
-        setStopLoss(d.stop_loss)
-        setMaxHoldDays(d.max_hold_days)
-        setEntrySignals(d.entry_signals ?? [])
-        setExitSignals(d.exit_signals ?? [])
-        setDisplayLimit(d.display_limit ?? null)
-        setBasicFilterEnabled(d.basic_filter?.enabled !== false)
-      } finally {
-        setResetting(false)
-      }
+      setScoring(d.scoring)
+      setScoringDirections(d.scoring_directions ?? {})
+      setStopLoss(d.stop_loss)
+      setMaxHoldDays(d.max_hold_days)
+      setEntrySignals(d.entry_signals ?? [])
+      setExitSignals(d.exit_signals ?? [])
+      setDisplayLimit(d.display_limit ?? null)
+      setBasicFilterEnabled(d.basic_filter?.enabled !== false)
+      setCompositeChildren(d.composite_children ?? [])
+    } finally {
+      setResetting(false)
+    }
   }
 
   const handleDelete = async () => {
@@ -336,17 +360,21 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
   return (
     <>
     <Modal
-      onClose={onClose}
+      onClose={() => {
+        // 子策略编辑弹窗打开期间(Esc 会同时到达两层的 document 监听), 只关最上层的子编辑
+        if (editingChildId) return
+        onClose()
+      }}
       labelledBy="strategy-settings-title"
       overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
-      panelClassName="w-[980px] max-h-[88vh] bg-surface/95 backdrop-blur-xl border border-border/50 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+      panelClassName="w-[1200px] max-w-[95vw] max-h-[88vh] bg-surface/95 backdrop-blur-xl border border-border/50 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
     >
           {/* 标题 */}
           <div className="flex items-center justify-between px-5 py-3 border-b border-border/50">
             <div className="flex items-center gap-2.5">
               <Settings2 className="h-4 w-4 text-accent" />
               <span id="strategy-settings-title" className="text-sm font-semibold text-foreground">{detail?.name ?? strategyId}</span>
-              {detail && <span className="text-[10px] px-1.5 py-0.5 rounded bg-elevated text-muted">{{ builtin: '内置', custom: '自定义', ai: 'AI' }[detail.source] ?? detail.source}</span>}
+              {detail && <span className="text-[10px] px-1.5 py-0.5 rounded bg-elevated text-muted">{{ builtin: '内置', custom: '自定义', ai: 'AI', composite: '叠加' }[detail.source] ?? detail.source}</span>}
               <span className="text-[10px] text-muted/40 font-mono">{strategyId}</span>
             </div>
             <div className="flex items-center gap-2">
@@ -393,7 +421,100 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                   </div>
                 </div>
 
-                {/* 三列 */}
+                {/* 叠加策略: 子策略列表 + 权重(替换三列参数, composite 专属) */}
+                {detail.source === 'composite' ? (() => {
+                  const SRC_LABEL: Record<string, string> = { builtin: '内置', custom: '自定义', ai: 'AI' }
+                  const SRC_CLS: Record<string, string> = {
+                    builtin: 'border-accent/25 bg-accent/10 text-accent',
+                    custom: 'border-amber-400/25 bg-amber-400/10 text-amber-400',
+                    ai: 'border-purple-500/25 bg-purple-500/10 text-purple-400',
+                  }
+                  const selectedIds = new Set(compositeChildren.map(c => c.id))
+                  const candidates = allStrategies.filter(s => !selectedIds.has(s.id))
+                  return (
+                  <div className="rounded-xl border border-teal-500/20 bg-teal-500/5 p-4 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <Layers className="h-4 w-4 text-teal-400" />
+                      <span className="text-sm font-medium text-foreground">子策略与权重</span>
+                      <span className="text-[10px] text-muted flex items-center gap-1.5">
+                        共 {compositeChildren.length} 个 · 权重
+                        <span className={`font-mono ${compositeChildren.length > 0 && compositeTotal !== 100 ? 'text-amber-400' : 'text-emerald-400'}`}>
+                          {compositeTotal}%
+                        </span>
+                        {compositeChildren.length > 0 && compositeTotal !== 100 && (
+                          <span className="text-amber-400/60">(保存时自动按比例归一)</span>
+                        )}
+                      </span>
+                      <button onClick={() => setShowAddChild(v => !v)} className="ml-auto inline-flex items-center gap-1 h-6 px-2 rounded-lg border border-teal-500/30 bg-teal-500/10 text-[11px] text-teal-400 hover:bg-teal-500/20">
+                        <Plus className="h-3 w-3" />添加
+                      </button>
+                    </div>
+                    {/* 添加子策略面板 */}
+                    {showAddChild && (
+                      <div className="rounded-lg border border-border bg-base/60 p-2 space-y-1 max-h-48 overflow-y-auto">
+                        {candidates.length === 0 ? (
+                          <div className="text-[11px] text-muted py-2 text-center">无可添加的策略</div>
+                        ) : candidates.map(s => (
+                          <button key={s.id} onClick={() => addCompositeChild(s)} className="flex w-full items-center gap-1.5 rounded px-2 py-1 text-left hover:bg-teal-500/10">
+                            <Plus className="h-3 w-3 shrink-0 text-teal-400" />
+                            <span className="flex-1 truncate text-xs text-foreground">{s.name}</span>
+                            {s.source && (
+                              <span className={`rounded border px-1 text-[8px] ${SRC_CLS[s.source] ?? ''}`}>{SRC_LABEL[s.source] ?? s.source}</span>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {compositeChildren.length === 0 ? (
+                      <div className="text-xs text-muted py-4 text-center">暂无子策略, 点击"添加"选择</div>
+                    ) : (
+                      <div className="space-y-1.5">
+                        {compositeChildren.map((c, i) => (
+                          <div key={c.id} className="flex items-center gap-2 rounded-lg bg-base/60 px-3 py-2">
+                            <span className="text-[10px] text-muted/50 font-mono w-5">{i + 1}</span>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingChildId(c.id)}
+                                  title="点击编辑该子策略的配置"
+                                  className="truncate text-left text-xs font-medium text-foreground transition-colors hover:text-accent cursor-pointer"
+                                >
+                                  {c.name || c.id}
+                                </button>
+                                {c.source && (
+                                  <span className={`rounded border px-1 text-[8px] shrink-0 ${SRC_CLS[c.source] ?? ''}`}>{SRC_LABEL[c.source] ?? c.source}</span>
+                                )}
+                              </div>
+                              <div className="text-[10px] text-muted/50 font-mono">{c.id}</div>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <input
+                                type="range"
+                                min={0}
+                                max={100}
+                                step={1}
+                                value={c.weight}
+                                onChange={e => setCompositeChildren(prev => prev.map((p, j) => j === i ? { ...p, weight: parseInt(e.target.value) || 0 } : p))}
+                                className="h-1 w-24 cursor-pointer accent-teal-400"
+                                aria-label={`${c.name || c.id}权重`}
+                              />
+                              <span className="w-9 text-right font-mono text-[10px] text-muted">{Math.round(c.weight)}%</span>
+                              <button onClick={() => removeCompositeChild(c.id)} className="text-danger/50 hover:text-danger p-1">
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="text-[10px] text-muted/60 pt-1 border-t border-border/30">
+                      提示: 权重按相对比例生效, 保存时自动归一; 修改后点底部"保存设置"生效。
+                    </div>
+                  </div>
+                  )
+                })()
+                : (
                 <div className="grid grid-cols-3 gap-5 items-start">
                   {/* 列1：选股条件 */}
                     <Section icon={Filter} title="基础参数" accent="text-sky-400">
@@ -448,54 +569,16 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                   {/* 列3：评分 + 交易 */}
                   <div className="space-y-3">
                     <Section icon={Star} title="评分权重" accent="text-amber-400">
-                      {Object.entries(scoring).length > 0 ? (() => {
-                        const total = Object.values(scoring).reduce((a: number, b: number) => a + b, 0) || 1
-                        return (
-                          <div className="space-y-2">
-                            {Object.entries(scoring).map(([col, w]) => {
-                              const pct = Math.round((w / total) * 100)
-                              return (
-                                <ScoringField key={col} col={col} weight={w} pct={pct}
-                                  editing={editingScoring}
-                                  onChange={v => setScoring({ ...scoring, [col]: Math.max(0, v) })} />
-                              )
-                            })}
-                            <div className="flex items-center justify-between pt-1.5 border-t border-border/10">
-                              <div className="flex items-center gap-1.5 text-[10px] text-muted">
-                                <span>总和</span>
-                                <span className={`font-mono font-medium text-xs ${editingScoring ? (total === 100 ? color.ok : color.scoreWarn) : color.ok}`}>{editingScoring ? total : '100'}</span>
-                                <span className="text-muted/40">自动归权计算</span>
-                              </div>
-                              <button
-                                onClick={() => {
-                                  if (editingScoring) {
-                                    // 确认：归一化到 100
-                                    const sum = Object.values(scoring).reduce((a: number, b: number) => a + b, 0) || 1
-                                    const norm = Object.fromEntries(
-                                      Object.entries(scoring).map(([k, v]) => [k, Math.round((v / sum) * 100)])
-                                    )
-                                    // 修正舍入误差
-                                    const newSum = Object.values(norm).reduce((a: number, b: number) => a + b, 0)
-                                    if (newSum !== 100) {
-                                      const keys = Object.keys(norm)
-                                      norm[keys[0]] += (100 - newSum)
-                                    }
-                                    setScoring(norm)
-                                  } else {
-                                    // 进入编辑：展开为 0-100 范围
-                                    const sum = Object.values(scoring).reduce((a: number, b: number) => a + b, 0) || 1
-                                    setScoring(Object.fromEntries(
-                                      Object.entries(scoring).map(([k, v]) => [k, Math.round((v / sum) * 100)])
-                                    ))
-                                  }
-                                  setEditingScoring(v => !v)
-                                }}
-                                className="text-[10px] text-accent/80 hover:text-accent cursor-pointer"
-                              >{editingScoring ? '确定' : '设置'}</button>
-                            </div>
-                          </div>
-                        )
-                      })() : <div className="text-[11px] text-muted">未配置</div>}
+                      <ScoringEditor
+                        key={detail.id}
+                        value={scoring}
+                        directions={scoringDirections}
+                        fallbackLabels={FIELD_LABEL}
+                        onChange={(nextScoring, nextDirections) => {
+                          setScoring(nextScoring)
+                          setScoringDirections(nextDirections)
+                        }}
+                      />
                     </Section>
 
                     <Section icon={TrendingUp} title="交易参数" accent="text-emerald-400">
@@ -526,7 +609,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       defaultOpen={false}
                       extra={<SignalTriggerActions kind="entry" signals={entrySignals} onChange={setEntrySignals} buttonClassName="rounded-md border border-border bg-base p-1 text-muted transition-colors cursor-pointer" iconClassName="h-3 w-3" />}
                     >
-                      <SignalPicker signals={entrySignals} onChange={setEntrySignals} kind="entry" variant="dialog" />
+                      <SignalPicker signals={entrySignals} onChange={setEntrySignals} kind="entry" options={{ variant: 'dialog' }} />
                       <div className="text-[10px] leading-4 text-muted/70">任一入场点满足即进入候选。</div>
                     </Section>
 
@@ -537,7 +620,7 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       defaultOpen={false}
                       extra={<SignalTriggerActions kind="exit" signals={exitSignals} onChange={setExitSignals} buttonClassName="rounded-md border border-border bg-base p-1 text-muted transition-colors cursor-pointer" iconClassName="h-3 w-3" />}
                     >
-                      <SignalPicker signals={exitSignals} onChange={setExitSignals} kind="exit" variant="dialog" />
+                      <SignalPicker signals={exitSignals} onChange={setExitSignals} kind="exit" options={{ variant: 'dialog' }} />
                       <div className="text-[10px] leading-4 text-muted/70">任一出场点满足即触发出场。</div>
                     </Section>
 
@@ -545,17 +628,9 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                       出入场触发器保存后对<b className="text-secondary">回测和监控</b>生效;选股扫描仍按策略本身的筛选规则,不受此影响。
                     </div>
 
-                    {detail.alerts.length > 0 && (
-                      <Section icon={Settings2} title="提醒" accent="text-muted">
-                        <div className="space-y-1">
-                          {detail.alerts.map((a, i) => (
-                            <div key={i} className="text-[10px] text-secondary">{a.message} <span className="text-muted font-mono">{a.op ? `${FIELD_LABEL[a.field] ?? a.field} ${a.op} ${a.value}` : FIELD_LABEL[a.field] ?? a.field}</span></div>
-                          ))}
-                        </div>
-                      </Section>
-                    )}
                   </div>
                 </div>
+                )}
               </>
             ) : (
               <div className="flex items-center justify-center py-16 text-sm text-muted">加载失败</div>
@@ -569,13 +644,13 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
                 className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-border bg-surface text-xs text-secondary hover:text-danger hover:border-danger/30 transition-colors cursor-pointer disabled:opacity-50">
                 <RotateCcw className="h-3.5 w-3.5" />{resetting ? '重置中…' : '重置默认'}
               </button>
-              {(detail?.source === 'ai' || detail?.source === 'custom') && (
+              {(detail?.source === 'ai' || detail?.source === 'custom' || detail?.source === 'composite') && (
                 <button onClick={() => { setDeleteError(''); setShowDeleteConfirm(true) }}
-                  className="text-[10px] text-muted/40 hover:text-danger transition-colors">删除策略</button>
+                  className="text-[10px] text-danger hover:text-danger/80 transition-colors">删除策略</button>
               )}
             </div>
             <div className="flex items-center gap-2">
-              {(detail?.source === 'ai' || detail?.source === 'custom') && (
+              {onAiModify && (detail?.source === 'ai' || detail?.source === 'custom') && (
                 <button onClick={onAiModify}
                   className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-amber-400/30 bg-amber-400/8 text-amber-400 text-xs font-medium hover:bg-amber-400/15 transition-colors cursor-pointer">
                   <Sparkles className="h-3.5 w-3.5" />AI 修改
@@ -632,6 +707,26 @@ export function StrategySettingsDialog({ strategyId, onClose, onSaved, onAiModif
         </motion.div>
       </AnimatePresence>
     )}
+
+    {/* 子策略配置编辑 — 同删除确认弹窗一样必须放 Modal 外 (面板 backdrop-blur 会为
+        fixed 后代建立定位上下文)。渲染在主 Modal 之后, 同 z-50 自然覆盖其上。 */}
+    <StrategySettingsDialog
+      strategyId={editingChildId}
+      onClose={() => setEditingChildId(null)}
+      onSaved={() => {
+        // 子策略可能改名: 拉最新名称同步到列表 (参数 override 按策略 ID 生效, 无需重建叠加)
+        if (!editingChildId) return
+        api.strategyGet(editingChildId)
+          .then(d => setCompositeChildren(prev =>
+            prev.map(c => c.id === editingChildId ? { ...c, name: d.name ?? c.name } : c),
+          ))
+          .catch(() => {})
+      }}
+      onDeleted={() => {
+        setCompositeChildren(prev => prev.filter(c => c.id !== editingChildId))
+        setEditingChildId(null)
+      }}
+    />
     </>
 
   )

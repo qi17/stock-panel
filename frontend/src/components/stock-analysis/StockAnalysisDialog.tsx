@@ -5,11 +5,14 @@ import {
   Settings2, Send, Wand2, Minimize2, History, LineChart,
 } from 'lucide-react'
 import { cn } from '@/lib/cn'
+import { copyText } from '@/lib/clipboard'
+import { toast } from '@/components/Toast'
 import { MarkdownRenderer } from '@/components/financials/MarkdownRenderer'
 import {
   type ActiveTask, type HistoryReport,
   minimizeDialog, closeDialog, startAnalysis,
 } from '@/lib/stockAnalysisStore'
+import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 
 /**
  * AI 个股分析对话框 —— 蓝色主题,与财务分析对话框区分。
@@ -68,12 +71,17 @@ export function StockAnalysisDialog({ task, mode, minimized }: Props) {
 
   const handleCopy = async () => {
     if (!content) return
-    try {
-      await navigator.clipboard.writeText(content)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } catch { /* ignore */ }
+    const success = await copyText(content)
+    if (!success) {
+      toast('复制失败,请手动选择文本', 'error')
+      return
+    }
+    setCopied(true)
+    toast('已复制到剪贴板', 'success')
+    setTimeout(() => setCopied(false), 2000)
   }
+
+  const backdrop = useDialogBackdrop(closeDialog, () => !isWorking)
 
   if (!open) return null
 
@@ -84,7 +92,7 @@ export function StockAnalysisDialog({ task, mode, minimized }: Props) {
       <motion.div
         initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
         className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
-        onClick={e => { if (e.target === e.currentTarget && !isWorking) closeDialog() }}
+        {...backdrop}
       >
         <motion.div
           initial={{ opacity: 0, scale: 0.96, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 12 }}

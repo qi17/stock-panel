@@ -7,7 +7,7 @@
 1. **只创建这一个策略文件**：只生成一个 `.py` 文件，绝不创建多文件、不拆分模块、不跨文件 import
 2. **绝不触碰项目源码**：不要写任何会修改 `backend/`、`docs/`、`frontend/` 等现有文件的代码；不要 `import os/sys/pathlib` 等文件系统模块
 3. **不得放入内置策略目录**：AI 生成的策略只属于 `data/strategies/ai/`，文件名/ID 用 `ai_` 前缀；内置目录 `backend/app/strategy/builtin/` 由项目维护，AI 不得染指
-4. 只 `import polars as pl`，不 import 其他模块
+4. Polars 策略只 `import polars as pl`；矩阵策略只 import NumPy 和 `app.backtest.matrix` 协议/算子
 5. 贴合用户需求优先：不要为了套模板而歪曲策略含义
 
 ## 选择策略模式
@@ -35,9 +35,8 @@
 1. **META**：id(name, description, tags, params, scoring, basic_filter, limit 等)
 2. **ENTRY_SIGNALS / EXIT_SIGNALS**：根据策略逻辑自行选择合适的信号列（参考下方可用信号表），不要照抄示例
 3. **STOP_LOSS / MAX_HOLD_DAYS**：根据策略类型合理设定，做多止损一般为 -5%~-8%，短线持有 5~20 天
-4. **ALERTS**：列出需要监控提醒的条件
-5. **RULES**：中文逐条列出核心筛选逻辑（至少 3 条），准确完整
-6. **filter() 或 filter_history()**：核心筛选逻辑
+4. **RULES**：中文逐条列出核心筛选逻辑（至少 3 条），准确完整
+5. **EXECUTION_BACKEND + filter() 或 filter_history()**：只选择一个后端和一份核心筛选逻辑
 
 ## 性能原则
 
@@ -69,7 +68,7 @@ META = {
         # 只把用户可能调节的阈值放这里；每个参数含 id/label/type/default/min/max/step
     ],
     "scoring": {
-        # 根据策略核心逻辑定制权重，总和 = 1.0
+        # 只使用真实数值字段或 ma20_bias，总和 = 1.0
     },
     "order_by": "score",
     "descending": True,
@@ -83,8 +82,6 @@ EXIT_SIGNALS = []
 # 根据策略类型设定
 STOP_LOSS = -0.05
 MAX_HOLD_DAYS = 20
-
-ALERTS = []
 
 RULES = """
 1. 规则一
@@ -135,8 +132,6 @@ EXIT_SIGNALS = []
 
 STOP_LOSS = -0.05
 MAX_HOLD_DAYS = 20
-
-ALERTS = []
 
 RULES = """
 1. 规则一（包含时序逻辑）
@@ -199,7 +194,7 @@ def filter_history(df: pl.DataFrame, params: dict) -> pl.DataFrame:
 1. 用户可能调节的阈值才放 `params`；公式常数、固定窗口边界不必参数化
 2. 信号列使用 `.fill_null(False)` 处理空值
 3. `filter()` 只返回 `pl.Expr`，`filter_history()` 返回筛选后的 `DataFrame`
-4. scoring 权重总和 = 1.0
+4. scoring 权重总和 = 1.0，键只能使用可用数值列或临时评分字段 `ma20_bias`，不要使用 `close_above_ma20` 等条件名称
 5. **必须生成 RULES**：用中文逐条列出核心逻辑（至少 3 条），准确完整
 6. **贴合用户需求**：不为了用已有字段而改变用户本意。用户说"前高"就自己算前高
 7. **输出前自我检查**：确认 RULES 完整、语法正确、括号匹配、引号闭合

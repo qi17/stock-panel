@@ -20,21 +20,21 @@
 
 ## 你应该做的事
 
-- 增/删/改参数 → 更新 META["params"]，同步修改 filter()
+- 增/删/改参数 → 更新 META["params"]，同步修改当前执行后端对应的 `filter()`、`filter_history()` 或 `MATRIX_STRATEGY`
 - 调整信号 → 更新 ENTRY_SIGNALS / EXIT_SIGNALS
 - 修改止损/持有 → 更新 STOP_LOSS / MAX_HOLD_DAYS
-- 增减告警 → 更新 ALERTS
-- 调整评分 → 更新 META["scoring"]，权重总和保持 100
-- 修改筛选逻辑 → 更新 filter()；如果新增/删除了历史回溯逻辑，同步改为或移除 filter_history() 与 LOOKBACK_DAYS
+- 调整评分 → 更新 META["scoring"]；只使用真实数值字段或受控虚拟字段 `ma20_bias`，权重总和保持 1.0
+- 修改筛选逻辑 → 更新唯一公式；新增历史回溯时切换为 `python_history_legacy` + `filter_history()`，移除回溯时切回 `polars_expr` + `filter()`，不得同时保留两套公式
 
 ## 规则
 
-1. 保持策略文件结构完整，不丢失任何已有字段（包括 RULES）
-2. 删除参数后 filter() 中用原 default 值代替
-3. 新增参数要有 type、label、default、min、max、step
-4. 删除信号时 ENTRY_SIGNALS / EXIT_SIGNALS 至少保留一个
+1. 保持策略文件结构完整，不丢失任何已有字段（包括 RULES）；`META` 必须保持为模块顶层字面量字典 `META = {...}` 或 `META: dict = {...}`
+2. 删除参数后，在当前执行入口中用原 default 值代替
+3. 新增参数必须有 id、type、label、default；float/int 增加 min、max、step，select 增加 options
+4. ENTRY_SIGNALS / EXIT_SIGNALS 只保留与策略逻辑直接相关的信号；没有匹配信号时允许为空，不得凑数
 5. 如果修改了筛选逻辑，同步更新 RULES 中的对应条目
 6. 用户可能调节的阈值才需要放入 META["params"]；公式常数、固定窗口边界不必强行参数化
 7. 优先使用 Polars 表达式、窗口函数、聚合和 join，不要默认改成逐行/逐股 Python 循环
 8. **输出前自我检查**：完整通读修改后的代码，确认 Python 语法正确、括号匹配、引号闭合、缩进一致。有错误直接修正再输出。
 9. 直接输出完整 Python 代码
+10. 历史代码中的 `ALERTS` 已废弃，输出时删除；实时提醒由监控中心统一管理

@@ -15,7 +15,7 @@
 | 方向 | 做多 |
 | 规则 | 前一交易日为明显阴线且跌幅不低于2%，今日阳线收盘反包前一日实体，收盘价接近或高于前一日高点，成交量较前一日放大1.2倍以上，当前 close > ma5 或 close > ma10；使用 filter_history，并优先用 Polars shift/with_columns/filter 实现。 |
 
-点击「AI 生成」，AI 返回完整策略代码（含参数、信号、评分、告警）：
+点击「AI 生成」，AI 返回完整策略代码（含参数、信号、评分）：
 
 ```python
 """强势反包 — 前日阴线下跌 + 今日放量阳线反包"""
@@ -26,6 +26,8 @@ META = {
     "name": "强势反包",
     "description": "筛选前日阴线下跌、今日放量阳线反包的短线强势股",
     "tags": ["反包", "短线", "放量"],
+    "asset_types": ["stock"],
+    "timeframes": ["1d"],
     "basic_filter": {
         "price_min": 3,
         "price_max": 200,
@@ -73,15 +75,13 @@ META = {
     "limit": 100,
 }
 
+EXECUTION_BACKEND = "python_history_legacy"
 LOOKBACK_DAYS = 2
 
 ENTRY_SIGNALS = ["signal_broken_board_recovery"]
 EXIT_SIGNALS = ["signal_ma20_breakdown"]
 STOP_LOSS = -0.05
 MAX_HOLD_DAYS = 10
-ALERTS = [
-    {"field": "signal_broken_board_recovery", "message": "反包信号"},
-]
 
 RULES = """
 1. 前一交易日为阴线，且跌幅不小于设定阈值

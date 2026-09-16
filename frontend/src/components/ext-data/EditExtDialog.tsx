@@ -4,9 +4,11 @@ import { motion } from 'framer-motion'
 import { X, Loader2, Upload } from 'lucide-react'
 import { api, type ExtDataConfig, type ExtDataField } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
+import { useDialogBackdrop } from '@/lib/useDialogBackdrop'
 
 export function EditExtDialog({ config, onClose }: { config: ExtDataConfig; onClose: () => void }) {
   const qc = useQueryClient()
+  const backdrop = useDialogBackdrop(onClose)
   const [label, setLabel] = useState(config.label)
   const [description, setDescription] = useState(config.description ?? '')
   const [fields, setFields] = useState<ExtDataField[]>([...config.fields])
@@ -79,13 +81,13 @@ export function EditExtDialog({ config, onClose }: { config: ExtDataConfig; onCl
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" {...backdrop} />
       <motion.div
         initial={{ opacity: 0, scale: 0.95, y: 12 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.97, y: 8 }}
         transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-        className="relative rounded-2xl border border-border bg-surface shadow-2xl mx-4 w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden"
+        className="relative rounded-2xl border border-border bg-surface shadow-2xl mx-4 w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden"
       >
         <div className="flex items-center justify-between px-5 py-3 border-b border-border">
           <h3 className="text-sm font-medium text-foreground">编辑扩展数据</h3>

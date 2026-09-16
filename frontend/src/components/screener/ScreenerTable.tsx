@@ -6,9 +6,9 @@
  * score、signals、candle、ext 列。其余纯数据列（价格/指标/财务…）交给共享原语。
  */
 import { useState, type CSSProperties, type ReactNode } from 'react'
-import { Check, Plus, Eye, EyeOff, RefreshCw } from 'lucide-react'
+import { Check, Plus, Eye, EyeOff, RefreshCw, ListCollapse, ListTree } from 'lucide-react'
 import type { KlineRow, MinuteKlineRow } from '@/lib/api'
-import { fmtPrice, fmtBigNum, priceColorClass, getExtNumColorClass } from '@/lib/format'
+import { fmtPrice, fmtBigNum, getExtNumColorClass, formatExtNumber } from '@/lib/format'
 import type { ColumnConfig } from '@/lib/screener-columns'
 import { getSignals, signalCls } from '@/lib/stock-table'
 import { boardTag, renderBuiltinDataCell } from '@/components/stock-table/primitives'
@@ -16,6 +16,14 @@ import { resolveCandleConfig, resolveIntradayConfig } from '@/lib/list-columns'
 import { MiniCandlestick } from '@/components/stock-table/MiniCandlestick'
 import { MiniIntraday } from '@/components/stock-table/MiniIntraday'
 import { StockDataTable, type SortState } from '@/components/stock-table/StockDataTable'
+import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
+import {
+  DimensionMembersDialog,
+  dimensionKindForSourceField,
+  type DimensionMembersTarget,
+} from '@/components/DimensionMembersDialog'
+import { toNavItems, type NavItem } from '@/components/StockPreviewDialog'
+import { cn } from '@/lib/cn'
 
 interface ScreenerTableProps {
   rows: any[]
@@ -24,8 +32,9 @@ interface ScreenerTableProps {
   symbolStrategyMap: Map<string, string[]>
   activeStrategy: string | null
   watchlistSet: Set<string>
-  onPreview: (symbol: string, name: string) => void
-  onToggleWatchlist: (symbol: string, inList: boolean) => void
+  onPreview: (symbol: string, name?: string, navList?: NavItem[]) => void
+  onAddToWatchlist: (symbol: string, groupId: string | null) => void
+  onRemoveFromWatchlist: (symbol: string) => void
   watchlistPending: boolean
   /** symbol → 日k 数据，仅当启用日k列时传入 */
   klineData?: Record<string, KlineRow[]>
@@ -43,23 +52,32 @@ interface ScreenerTableProps {
   onRefreshIntraday?: () => void
   /** 分时数据正在刷新中 (按钮 loading 态) */
   intradayRefreshing?: boolean
+  /** 策略列标签全表展开状态 (false=默认收起: 每行仅显示首个策略+计数) */
+  strategyTagsExpanded?: boolean
+  /** 表头策略列图标: 切换全表展开/收起 */
+  onToggleStrategyTags?: () => void
   /** 表头排序（受控，由 Screener.tsx 传入） */
   sort?: SortState | null
   onSortToggle?: (colId: string) => void
+  /** 正在 K 线弹窗预览中的 symbol → 高亮该行 */
+  activeSymbol?: string | null
 }
 
-/** 渲染标签数组（含 maxTags 折叠/展开、横竖排列）。策略列与 ext 列共用。 */
+/** 渲染标签数组（含 maxTags 折叠/展开、横竖排列）。策略列与 ext 列共用。
+ *  maxTagsOverride: 调用方直接指定折叠上限 (策略列用: 全局展开=0 不折叠, 收起=1 只显首个)。 */
 function renderTagList(
   tags: string[],
   col: ColumnConfig,
   expanded: boolean,
   onToggle: () => void,
   tagClassName: string,
+  onTagClick?: (tag: string) => void,
+  maxTagsOverride?: number,
 ): ReactNode {
   if (tags.length === 0) return <span className="text-muted">—</span>
 
   const cfg = col.extDisplay
-  const maxTags = cfg?.maxTags ?? 0
+  const maxTags = maxTagsOverride ?? cfg?.maxTags ?? 0
   const showAll = maxTags <= 0 || expanded || tags.length <= maxTags
   const sliced = showAll ? tags : tags.slice(0, maxTags)
   const hiddenIndices = maxTags > 0 ? cfg?.hiddenIndices : undefined
@@ -67,11 +85,21 @@ function renderTagList(
     ? sliced.filter((_, i) => !hiddenIndices.includes(i))
     : sliced
   const hiddenCount = tags.length - visibleTags.length
-  const isVertical = cfg?.tagLayout === 'vertical' && !expanded
+  // 排列方向始终跟随列设置: 竖向时收起/展开都竖排, 展开不再强制横向
+  const isVertical = cfg?.tagLayout === 'vertical'
 
   return (
     <div className={isVertical ? 'flex flex-col items-start gap-0.5' : 'flex flex-wrap gap-0.5'}>
-      {visibleTags.map((tag, i) => (
+      {visibleTags.map((tag, i) => onTagClick ? (
+        <button
+          key={i}
+          type="button"
+          onClick={event => { event.stopPropagation(); onTagClick(tag) }}
+          className={`${tagClassName} hover:brightness-95`}
+        >
+          {tag}
+        </button>
+      ) : (
         <span key={i} className={tagClassName}>{tag}</span>
       ))}
       {!showAll && hiddenCount > 0 && (
@@ -102,10 +130,16 @@ function renderExtValue(
   col: ColumnConfig,
   expanded: boolean,
   onToggle: () => void,
+  onTagClick?: (tag: string) => void,
 ): ReactNode {
   if (val == null || Number.isNaN(val)) return <span className="text-muted">—</span>
   if (typeof val === 'number') {
-    const displayVal = Math.abs(val) >= 10000 ? fmtBigNum(val) : (Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val))
+    // 数字格式化: 千分位 + 单位换算 + 小数位(由列配置控制)
+    const cfg = col.extDisplay
+    const hasNumFmt = cfg?.thousandSeparator || (cfg?.unitConvert && cfg.unitConvert !== 'none')
+    const displayVal = hasNumFmt
+      ? formatExtNumber(val, { thousandSeparator: cfg?.thousandSeparator, unitConvert: cfg?.unitConvert, unitDecimals: cfg?.unitDecimals })
+      : (Math.abs(val) >= 10000 ? fmtBigNum(val) : (Number.isInteger(val) ? fmtPrice(val, 0) : fmtPrice(val)))
     const fieldName = col.source.type === 'ext' ? col.source.fieldName : ''
     const colorCls = getExtNumColorClass(val, fieldName, col.label)
     return <span className={`tabular-nums ${colorCls}`}>{displayVal}</span>
@@ -123,18 +157,20 @@ function renderExtValue(
     ? str.split(separator).map(s => s.trim()).filter(Boolean)
     : str.split(/[、,，;；\-]/).map(s => s.trim()).filter(Boolean)
 
-  return renderTagList(tags, col, expanded, onToggle, EXT_TAG_CLS)
+  return renderTagList(tags, col, expanded, onToggle, EXT_TAG_CLS, onTagClick)
 }
 
 export function ScreenerTable({
   rows, columns, strategyIdToName, symbolStrategyMap, activeStrategy,
-  watchlistSet, onPreview, onToggleWatchlist, watchlistPending, klineData = {},
+  watchlistSet, onPreview, onAddToWatchlist, onRemoveFromWatchlist, watchlistPending, klineData = {},
   dailyKChartVisible = true, onToggleDailyKChart,
   minuteData = {}, intradayChartVisible = true, onToggleIntradayChart,
   intradayAutoRefresh = false, onRefreshIntraday, intradayRefreshing = false,
-  sort, onSortToggle,
+  strategyTagsExpanded = false, onToggleStrategyTags,
+  sort, onSortToggle, activeSymbol,
 }: ScreenerTableProps) {
   const [expandedCells, setExpandedCells] = useState<Set<string>>(new Set())
+  const [dimensionTarget, setDimensionTarget] = useState<DimensionMembersTarget | null>(null)
 
   // 日k列渲染尺寸（按眼睛开关取开启/收起尺寸）
   const candleCol = columns.find(c => c.source.type === 'builtin' && c.source.key === 'candle' && c.visible)
@@ -159,6 +195,19 @@ export function ScreenerTable({
     })
   }
 
+  // 策略列全表切换: 收起时清除该列的行级展开状态, 保证"收起"立即对全表生效
+  const strategiesColId = columns.find(c => c.source.type === 'builtin' && c.source.key === 'strategies')?.id
+  const handleToggleStrategyTags = () => {
+    if (strategyTagsExpanded && strategiesColId) {
+      const suffix = `::${strategiesColId}`
+      setExpandedCells(prev => {
+        const next = new Set([...prev].filter(k => !k.endsWith(suffix)))
+        return next.size === prev.size ? prev : next
+      })
+    }
+    onToggleStrategyTags?.()
+  }
+
   const renderCell = (r: any, col: ColumnConfig): ReactNode => {
     // ext 列
     if (col.source.type === 'ext') {
@@ -166,6 +215,8 @@ export function ScreenerTable({
       const val = r[`${configId}__${fieldName}`]
       const cellKey = `${r.symbol}::${col.id}`
       const expanded = expandedCells.has(cellKey)
+      const sourceField = `${configId}.${fieldName}`
+      const dimensionKind = dimensionKindForSourceField(sourceField)
       const tdClass = val == null || Number.isNaN(val)
         ? 'px-3 py-2 text-center text-muted'
         : typeof val === 'number'
@@ -175,7 +226,13 @@ export function ScreenerTable({
       if (col.extDisplay?.maxWidth) style.maxWidth = col.extDisplay.maxWidth
       return (
         <td key={col.id} className={tdClass} style={style}>
-          {renderExtValue(val, col, expanded, () => toggleExpand(cellKey))}
+          {renderExtValue(
+            val,
+            col,
+            expanded,
+            () => toggleExpand(cellKey),
+            dimensionKind ? value => setDimensionTarget({ kind: dimensionKind, value, sourceField }) : undefined,
+          )}
         </td>
       )
     }
@@ -193,7 +250,7 @@ export function ScreenerTable({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => onPreview(r.symbol, r.name ?? '')}
+                onClick={() => onPreview(r.symbol, r.name ?? '', toNavItems(rows))}
                 className={`flex items-center gap-2 text-left ${isExpired ? 'cursor-default' : ''}`}
               >
                 {board ? (
@@ -217,20 +274,27 @@ export function ScreenerTable({
                   失效
                 </span>
               ) : (
-                <button
-                  type="button"
-                  onClick={() => onToggleWatchlist(r.symbol, inWatchlist)}
-                  disabled={watchlistPending}
-                  className={`shrink-0 inline-flex items-center justify-center w-5 h-5 rounded-full border transition-colors cursor-pointer
-                    disabled:opacity-50
-                    ${inWatchlist
-                      ? 'border-accent/40 bg-accent/10 text-accent'
-                      : 'border-border text-muted hover:border-accent/40 hover:text-accent'
-                    }`}
-                  title={inWatchlist ? '移出自选' : '加入自选'}
-                >
-                  {inWatchlist ? <Check className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
-                </button>
+                inWatchlist ? (
+                  <button
+                    type="button"
+                    onClick={() => onRemoveFromWatchlist(r.symbol)}
+                    disabled={watchlistPending}
+                    className="shrink-0 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-accent/40 bg-accent/10 text-accent transition-colors disabled:opacity-50"
+                    title="移出自选"
+                    aria-label={`将 ${r.symbol} 移出自选`}
+                  >
+                    <Check className="h-3 w-3" />
+                  </button>
+                ) : (
+                  <WatchlistAddMenu
+                    onSelect={groupId => onAddToWatchlist(r.symbol, groupId)}
+                    disabled={watchlistPending}
+                    triggerClassName="shrink-0 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full border border-border text-muted transition-colors hover:border-accent/40 hover:text-accent disabled:opacity-50"
+                    ariaLabel={`将 ${r.symbol} 加入自选`}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </WatchlistAddMenu>
+                )
               )}
             </div>
           </td>
@@ -241,9 +305,13 @@ export function ScreenerTable({
         const tags = strats.map(sid => strategyIdToName[sid] ?? sid)
         const cellKey = `${r.symbol}::${col.id}`
         const expanded = expandedCells.has(cellKey)
+        // 收起时每行显示前N个 + "+N" 计数 (跟随列设置"显示前N个", 未配置默认 3),
+        // 点击计数/收起按钮可单独展开/收起本行; 全局展开: maxTags=0 全部显示不折叠
+        const cfgMaxTags = col.extDisplay?.maxTags ?? 0
+        const maxTags = strategyTagsExpanded ? 0 : (cfgMaxTags > 0 ? cfgMaxTags : 3)
         return (
           <td key={col.id} className="px-3 py-2">
-            {renderTagList(tags, col, expanded, () => toggleExpand(cellKey), STRATEGY_TAG_CLS)}
+            {renderTagList(tags, col, expanded, () => toggleExpand(cellKey), STRATEGY_TAG_CLS, undefined, maxTags)}
           </td>
         )
       }
@@ -322,20 +390,23 @@ export function ScreenerTable({
   }
 
   return (
-    <StockDataTable
-      columns={columns}
-      rows={rows}
-      renderCell={renderCell}
-      sort={sort}
-      onSortToggle={onSortToggle}
-      minWidth={Math.max(900, columns.filter(c => c.visible).length * 110)}
-      rowKey={(r: any) => `${r.symbol}${r._expired ? '-expired' : ''}`}
-      rowClassName={(r: any) => r._expired
-        ? 'border-border/50 opacity-40'
-        : 'border-border hover:bg-elevated/50'
-      }
-      // 日k / 分时列表头：标签 + 显示/隐藏的眼睛按钮（与自选页一致）
-      renderHeaderContent={(col) => {
+    <>
+      <StockDataTable
+        columns={columns}
+        rows={rows}
+        renderCell={renderCell}
+        sort={sort}
+        onSortToggle={onSortToggle}
+        minWidth={Math.max(900, columns.filter(c => c.visible).length * 110)}
+        rowKey={(r: any) => `${r.symbol}${r._expired ? '-expired' : ''}`}
+        rowClassName={(r: any) => cn(
+          r._expired
+            ? 'border-border/50 opacity-40'
+            : 'border-border hover:bg-elevated/50',
+          r.symbol === activeSymbol && 'bg-accent/10',
+        )}
+        // 日k / 分时列表头：标签 + 显示/隐藏的眼睛按钮（与自选页一致）
+        renderHeaderContent={(col) => {
         if (col.source.type !== 'builtin') return undefined
         const key = col.source.key
         // 日k 蜡烛图开关
@@ -397,8 +468,38 @@ export function ScreenerTable({
             </span>
           )
         }
+        // 策略列标签展开/收起开关 (命中多策略时行会很高, 默认收起只显首个+计数)
+        if (key === 'strategies' && onToggleStrategyTags) {
+          return (
+            <span className="inline-flex items-center justify-center gap-1.5">
+              <span>{col.label}</span>
+              <button
+                type="button"
+                onClick={(event) => { event.stopPropagation(); handleToggleStrategyTags() }}
+                className={`inline-flex items-center justify-center w-5 h-5 rounded transition-colors ${
+                  strategyTagsExpanded
+                    ? 'text-accent bg-accent/10 hover:bg-accent/20'
+                    : 'text-muted hover:text-foreground hover:bg-elevated'
+                }`}
+                title={strategyTagsExpanded ? '收起策略标签（每行仅显示前几个）' : '展开全部策略标签'}
+                aria-label={strategyTagsExpanded ? '收起策略标签' : '展开全部策略标签'}
+              >
+                {strategyTagsExpanded ? <ListTree className="h-3.5 w-3.5" /> : <ListCollapse className="h-3.5 w-3.5" />}
+              </button>
+            </span>
+          )
+        }
         return undefined
-      }}
-    />
+        }}
+      />
+      <DimensionMembersDialog
+        target={dimensionTarget}
+        onClose={() => setDimensionTarget(null)}
+        onStockClick={(symbol, name, navList) => {
+          setDimensionTarget(null)
+          onPreview(symbol, name ?? '', navList)
+        }}
+      />
+    </>
   )
 }

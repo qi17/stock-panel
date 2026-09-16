@@ -33,7 +33,12 @@ from pathlib import Path
 import polars as pl
 
 from app.tickflow.capabilities import Cap
-from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
+from app.tickflow.rate_limits import (
+    apply_safety_rpm,
+    chunked,
+    resolve_limit,
+    sleep_between_batches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +52,6 @@ TIER_INTERVAL_RANGE: dict[str, tuple[float, float]] = {
 DEFAULT_RANGE = (10.0, 120.0)
 
 # 限速余量: 只用 rpm 的 80%, 给系统其他 depth 调用留空间
-RPM_MARGIN = 0.8
 # 间隔硬下限/上限(任何套餐)
 INTERVAL_HARD_MIN = 10.0
 INTERVAL_HARD_MAX = 300.0
@@ -142,11 +146,18 @@ class DepthService:
             logger.warning("depth sealed 从 parquet 恢复失败: %s", e)
 
     def start_polling(self) -> None:
-        """启动盘中轮询线程(连板梯队监控开启 + 有能力 + 交易时段)。"""
+        """启动盘中轮询线程(连板梯队监控开启 + 实时行情开启 + 有能力)。
+
+        依赖实时行情开关: 实时行情关闭时 enriched 内存缓存停留在上一交易日,
+        轮询会反复拉取陈旧的涨跌停名单(浪费 API 额度且数据无意义)。
+        实时行情开关切换时由 settings API 调 stop_polling/start_polling 同步启停。
+        """
         if not self._has_capability():
             return
         from app.services import preferences
         if not preferences.get_limit_ladder_monitor_enabled():
+            return
+        if not preferences.get_realtime_quotes_enabled():
             return
         # check-then-act 加锁: 两个线程同时 start_polling 不会各起一个轮询线程
         with self._lock:
@@ -281,9 +292,30 @@ class DepthService:
             self._persist(enriched_date)
 
     def _call_depth_batch(self, symbols: list[str]) -> dict:
-        """调 tf.depth.batch, 按 capset 的 batch 切片 + 节流。返回 {symbol: MarketDepth}。"""
-        from app.tickflow.client import get_client
-        tf = get_client()
+        """按独立五档路由取数; 所有 provider 共用分片限速且失败不跨源回退。"""
+        from app.services import preferences
+
+        provider_name = preferences.get_depth5_data_provider()
+        if provider_name == "tickflow":
+            from app.data_providers.registry import get_provider
+
+            provider = get_provider("tickflow")
+        else:
+            from app.data_providers import custom as custom_sources
+
+            try:
+                if not custom_sources.provider_has_dataset(provider_name, "depth5"):
+                    logger.warning("depth provider %s 未声明 depth5, 跳过本轮", provider_name)
+                    return {}
+                provider = custom_sources.get_provider(provider_name)
+            except Exception as e:
+                logger.warning("depth provider %s 解析失败, 跳过本轮: %s", provider_name, e)
+                return {}
+
+        fetch_depth = getattr(provider, "get_depth_batch", None)
+        if not callable(fetch_depth):
+            logger.warning("depth provider %s 未实现 get_depth_batch, 跳过本轮", provider_name)
+            return {}
 
         capset = self._get_capset()
         limit = resolve_limit(capset, Cap.DEPTH5_BATCH, default_batch=100, default_rpm=30)
@@ -293,12 +325,23 @@ class DepthService:
         for i, chunk in enumerate(chunks):
             sleep_between_batches(i, limit.rpm, default_interval=2.0)
             try:
-                # SDK 的 batch 内部已按 batch_size 切, 这里再切一层防单请求过大
-                data = tf.depth.batch(chunk)
+                data = fetch_depth(chunk)
                 if isinstance(data, dict):
                     result.update(data)
+                else:
+                    logger.warning(
+                        "depth provider %s 第 %d 批返回非 dict, 已跳过",
+                        provider_name,
+                        i + 1,
+                    )
             except Exception as e:  # noqa: BLE001
-                logger.warning("depth.batch 第 %d 批失败(%d 只): %s", i + 1, len(chunk), e)
+                logger.warning(
+                    "depth provider %s 第 %d 批失败(%d 只): %s",
+                    provider_name,
+                    i + 1,
+                    len(chunk),
+                    e,
+                )
                 # 单批失败不影响其他批
         return result
 
@@ -511,9 +554,9 @@ class DepthService:
         raw_user = preferences.get_depth_polling_interval()
         user_interval = max(lo, min(hi, raw_user))
 
-        # ② 限速安全 clamp
+        # ② 限速安全 clamp（与 resolve_limit 共用 SAFETY_RPM_FACTOR，不叠乘）
         batches = max(1, math.ceil(n_symbols / batch_size))
-        usable_rpm = rpm * RPM_MARGIN
+        usable_rpm = apply_safety_rpm(rpm) or 1
         calls_per_min = usable_rpm / batches if batches > 0 else usable_rpm
         safe_interval = 60.0 / calls_per_min if calls_per_min > 0 else INTERVAL_HARD_MAX
 

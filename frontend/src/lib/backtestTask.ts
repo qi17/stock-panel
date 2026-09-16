@@ -66,7 +66,7 @@ function buildQuery(params: Record<string, string | number | boolean | undefined
 }
 
 /** 连接 SSE (新建或重连都用这个) */
-function connectSSE(url: string): void {
+async function connectSSE(url: string): Promise<void> {
   const id = current?.id ?? ++taskSeq
 
   // 关闭旧连接
@@ -74,6 +74,26 @@ function connectSSE(url: string): void {
     eventSource.close()
     eventSource = null
   }
+
+  // 预检: 4xx 拒绝 (如分钟策略回测的分钟K覆盖守卫 400) 时 EventSource 只会无 data 地
+  // onerror, 会被当成"连接中断"有界重试 — 先 fetch 一次把后端 detail 直接展示给用户。
+  try {
+    const probe = await fetch(url, { headers: { Accept: 'text/event-stream' } })
+    if (!probe.ok) {
+      let message = `回测请求失败 (${probe.status})`
+      try {
+        message = (await probe.json())?.detail ?? message
+      } catch { /* ignore */ }
+      await probe.body?.cancel().catch(() => {})
+      if (current?.id === id) {
+        current = { ...current, isPending: false, error: message, reconnecting: false }
+        emit()
+        localStorage.removeItem(RECONNECT_KEY)
+      }
+      return
+    }
+    await probe.body?.cancel().catch(() => {})
+  } catch { /* 网络层异常: 交给下方 EventSource 的重连逻辑 */ }
 
   const es = new EventSource(url)
   eventSource = es
@@ -181,6 +201,7 @@ export function startBacktest(params: {
   holding_days?: number
   asset_type?: 'stock' | 'etf'
   minute_fill?: boolean
+  regime_filter?: { states?: string[]; min_score?: number } | null
 }): void {
   // 取消之前的任务状态
   if (eventSource) {
@@ -214,6 +235,7 @@ export function startBacktest(params: {
     holding_days: params.holding_days,
     asset_type: params.asset_type,
     minute_fill: params.minute_fill,
+    regime_filter: params.regime_filter ? JSON.stringify(params.regime_filter) : undefined,
   })
 
   // 存 reconnect 信息 (刷新后用)

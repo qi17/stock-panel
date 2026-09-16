@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
-import { RefreshCw, Lock, Loader2, X, Search, FileText, Database, Clock, CheckCircle2, Hourglass, Lightbulb, ExternalLink } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { RefreshCw, Download, Lock, Loader2, X, Search, FileText, Database, Clock, CheckCircle2, Hourglass, Lightbulb, ExternalLink, ChartPie } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { EmptyState } from '@/components/EmptyState'
-import { useCapabilities } from '@/lib/useSharedQueries'
+import { useCapabilities, useCapabilityMatrix } from '@/lib/useSharedQueries'
+import { routeCapUsable } from '@/lib/capability-labels'
 import { useFinancialStatus, useFinancialSync } from '@/lib/useFinancials'
 import { StockFinancialSearch } from '@/components/financials/StockFinancialSearch'
 import { StockFinancialDetail } from '@/components/financials/StockFinancialDetail'
@@ -17,6 +19,7 @@ const TABLE_LABELS: Record<string, string> = {
   income: '利润表',
   balance_sheet: '资产负债表',
   cash_flow: '现金流量表',
+  shares: '股本表',
 }
 
 const TABLE_ICON: Record<string, typeof FileText> = {
@@ -24,12 +27,17 @@ const TABLE_ICON: Record<string, typeof FileText> = {
   income: FileText,
   balance_sheet: FileText,
   cash_flow: FileText,
+  shares: ChartPie,
 }
 
 export function Financials() {
   const { data: caps } = useCapabilities()
-  const hasFinancial = caps?.capabilities?.['financial'] != null
+  const { data: matrix } = useCapabilityMatrix()
   const { data: status, isLoading } = useFinancialStatus()
+  // 路由感知门控: 生效源当前能否提供财务数据 (含插件/自定义源);
+  // 矩阵未加载时回退 TickFlow 套餐视角 + 后端可用状态
+  const hasFinancial = routeCapUsable(matrix, 'financial')
+    ?? (caps?.capabilities?.['financial'] != null || status?.available === true)
   const syncMut = useFinancialSync()
   // 同步进行中 = 服务端真值(status.syncing)或本地乐观态(请求已发出待确认)。
   // 乐观窗口:点击后到 invalidate 触发的 refetch 返回之间,status.syncing 暂为 false,
@@ -60,16 +68,22 @@ export function Financials() {
   if (!hasFinancial) {
     return (
       <>
-        <PageHeader title="财务分析" subtitle="利润表 / 资负表 / 现金流 / 关键指标 / AI分析 · Expert" />
+        <PageHeader title="财务分析" subtitle="利润表 / 资负表 / 现金流 / 关键指标 / 股本 / AI分析" />
         <div className="px-8 py-10">
           <div className="mx-auto max-w-md rounded-card border border-warning/30 bg-warning/[0.04] p-8 text-center">
             <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-warning/10">
               <Lock className="h-6 w-6 text-warning" />
             </div>
-            <h3 className="mt-4 text-base font-semibold text-foreground">需要 Expert 套餐</h3>
+            <h3 className="mt-4 text-base font-semibold text-foreground">财务数据不可用</h3>
             <p className="mt-2 text-xs leading-relaxed text-secondary">
-              财务数据接口仅 Expert 套餐可用。升级后此页自动显示财务数据面板。
+              当前数据源未提供财务数据。配置提供财务数据的数据源后,此页自动显示财务数据面板。
             </p>
+            <Link
+              to="/settings?tab=data-sources"
+              className="mt-4 inline-flex items-center gap-1.5 rounded-btn bg-accent/90 px-3.5 py-1.5 text-xs font-medium text-base hover:bg-accent transition-colors"
+            >
+              前往数据源配置
+            </Link>
             {/* 当前财务数据源(TickFlow)需付费,后续将接入免费数据源;期间欢迎在 issues 推荐免费源 */}
             <div className="mt-5 rounded-btn border border-accent/25 bg-accent/[0.05] px-3.5 py-3 text-left">
               <div className="flex items-center gap-1.5 text-xs font-medium text-accent">
@@ -98,7 +112,7 @@ export function Financials() {
   const handleSync = (table: string) => {
     // 防重复点击:syncing 中不再触发(后端 trigger 也有 _is_syncing 兜底)
     if (syncing) return
-    // 记录开始时间: 全量同步判断所有 4 张表, 单表同步只判断这一张
+    // 记录开始时间: 全量同步判断所有财务表, 单表同步只判断这一张
     setSyncStartedAt(Date.now())
     setSyncSingleTable(table === 'all' ? null : table)
     syncMut.mutate(table, {
@@ -132,7 +146,7 @@ export function Financials() {
   // 本次同步进度: 仅当 syncStartedAt 存在且 syncing 时, 按 last_sync 时间戳判断
   const isFullSync = syncing && syncStartedAt && !syncSingleTable  // 全量同步
   const isSingleSync = syncing && syncStartedAt && !!syncSingleTable  // 单表同步
-  const TABLE_ORDER = ['metrics', 'income', 'balance_sheet', 'cash_flow'] as const
+  const TABLE_ORDER = ['metrics', 'income', 'balance_sheet', 'cash_flow', 'shares'] as const
   const tableDoneThisRound = (key: string): boolean => {
     if (!syncStartedAt || !syncing) return false
     // 单表同步: 只判断这一张表是否完成
@@ -157,7 +171,7 @@ export function Financials() {
     <>
       <PageHeader
         title="财务分析"
-        subtitle="利润表 / 资负表 / 现金流 / 关键指标 / AI分析 · Expert"
+        subtitle="利润表 / 资负表 / 现金流 / 关键指标 / 股本 / AI分析"
         right={
           <div className="flex items-center gap-2">
             <LastStockChip stock={lastStock} onSelect={pick} />
@@ -165,7 +179,7 @@ export function Financials() {
               <span className="text-xs text-accent/80 flex items-center gap-1.5">
                 <Loader2 className="w-3 h-3 animate-spin" />
                 {isFullSync
-                  ? `已同步 ${syncedCount}/4 张表…`
+                  ? `已同步 ${syncedCount}/${TABLE_ORDER.length} 张表…`
                   : isSingleSync
                     ? `同步${TABLE_LABELS[syncSingleTable!] ?? syncSingleTable}…`
                     : '同步中…'}
@@ -186,18 +200,18 @@ export function Financials() {
         }
       />
 
-      <div className="px-8 py-6 space-y-6 max-w-7xl">
+      <div className="px-3 sm:px-8 py-6 space-y-6 max-w-7xl">
         {syncing && (
           <div className="flex items-center gap-2 rounded-card border border-accent/30 bg-accent/[0.06] px-3 py-2 text-xs text-accent">
             <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
-            正在从 TickFlow 拉取财务数据，请稍候…
+            正在从财务数据源拉取数据，请稍候…
           </div>
         )}
 
         {/* 同步状态卡片 —— 始终显示,反映本地财务数据概况 */}
         {!isLoading && available && (
           <div>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
               {Object.entries(TABLE_LABELS).map(([key, label]) => {
                 const info = tables[key]
                 const TIcon = TABLE_ICON[key] ?? Database
@@ -237,11 +251,11 @@ export function Financials() {
                         className="text-muted hover:text-accent transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                         onClick={() => handleSync(key)}
                         disabled={syncing}
-                        title={syncing ? '正在同步…' : `同步${label}`}
+                        title={syncing ? '正在同步…' : `更新${label}`}
                       >
                         {syncing
                           ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          : <RefreshCw className="h-3.5 w-3.5" />}
+                          : <Download className="h-3.5 w-3.5" />}
                       </button>
                     </div>
                     <div className="mt-2 text-xl font-semibold tabular-nums text-foreground">
@@ -272,7 +286,7 @@ export function Financials() {
           <div className="rounded-card border border-dashed border-border bg-surface px-6 py-14 text-center">
             <Database className="mx-auto h-8 w-8 text-muted" />
             <div className="mt-3 text-sm text-secondary">暂无财务数据</div>
-            <div className="mt-1 text-xs text-muted">点击右上角"全部同步"从 TickFlow 拉取</div>
+            <div className="mt-1 text-xs text-muted">点击右上角"全部同步"从当前数据源拉取</div>
           </div>
         ) : (
           <>
@@ -316,7 +330,7 @@ export function Financials() {
                 <EmptyState
                   icon={Search}
                   title="未选择股票"
-                  hint="在上方搜索框输入股票代码或名称，选择后即可查看该股的核心指标、利润表、资产负债表与现金流量表。"
+                  hint="在上方搜索框输入股票代码或名称，选择后即可查看该股的核心指标、财务报表与股本历史。"
                 />
               )}
             </div>
