@@ -85,7 +85,11 @@ def _probe_tickflow(now: datetime) -> bool | None:
     无实时权限 / 网络失败 / 无有效戳 → None。
     """
     try:
-        from app.tickflow.client import get_client
+        from app.tickflow.client import get_client, _should_use_free_server
+
+        # 免费档不具备实时行情能力，直接返回 None 避免公网慢请求与 403 打印
+        if _should_use_free_server():
+            return None
 
         rows = get_client().quotes.get(symbols=list(_BASKET)) or []
         stamps = [r.get("timestamp") for r in rows if isinstance(r, dict)]

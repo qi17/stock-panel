@@ -338,13 +338,30 @@ def _get_previous_closes(
     start = min(trade_dates) - timedelta(days=45)
     end = max(trade_dates)
     try:
-        daily = repo.get_daily_asset(
-            asset_type,
-            symbol,
-            start,
-            end,
-            columns=["date", "close"],
-        ).sort("date")
+        daily = None
+        raw_fn = getattr(repo, "get_daily_asset_raw", None)
+        if callable(raw_fn):
+            res = raw_fn(
+                asset_type,
+                symbol,
+                start,
+                end,
+                columns=["date", "close"],
+            )
+            if isinstance(res, pl.DataFrame):
+                daily = res
+        if daily is None and hasattr(repo, "get_daily_asset"):
+            res = repo.get_daily_asset(
+                asset_type,
+                symbol,
+                start,
+                end,
+                columns=["date", "close"],
+            )
+            if isinstance(res, pl.DataFrame):
+                daily = res
+        if isinstance(daily, pl.DataFrame) and not daily.is_empty():
+            daily = daily.sort("date")
     except Exception:
         daily = None
     if daily is None or daily.is_empty():

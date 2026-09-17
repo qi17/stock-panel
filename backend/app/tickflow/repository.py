@@ -1557,6 +1557,50 @@ class KlineRepository:
             return self.get_etf_daily(symbol, start, end, columns)
         return pl.DataFrame()
 
+    def get_daily_asset_raw(
+        self,
+        asset_type: str,
+        symbol: str,
+        start: date,
+        end: date,
+        columns: list[str] | None = None,
+    ) -> pl.DataFrame:
+        """从内存缓存或 parquet 扫描日K基础列 (不计算衍生指标与信号), 用于快速读取收盘价等轻量场景。"""
+        df = pl.DataFrame()
+        if asset_type == "stock":
+            hist = self._enriched_history_cache
+            if hist is not None and not hist.is_empty() and "date" in hist.columns:
+                hist_min = self._enriched_history_start
+                hist_max = hist["date"].max()
+                if hist_min is not None and hist_min <= start and hist_max >= start:
+                    df = hist.filter(
+                        (pl.col("symbol") == symbol)
+                        & (pl.col("date") >= start)
+                        & (pl.col("date") <= end)
+                    )
+                    if columns and not df.is_empty():
+                        existing = [c for c in columns if c in df.columns]
+                        df = df.select(existing)
+            if df.is_empty():
+                df = self._scan_daily_symbol(symbol, start, end, columns)
+        elif asset_type == "index":
+            df = self._scan_index_daily_symbol(symbol, start, end, columns)
+        elif asset_type == "etf":
+            df = self._scan_etf_daily_symbol(symbol, start, end, columns)
+        else:
+            df = pl.DataFrame()
+
+        # 尝试用最新缓存行覆盖
+        cached, cache_date = self.get_enriched_latest()
+        if not df.is_empty() and cached is not None and not cached.is_empty() and cache_date:
+            if start <= cache_date <= end:
+                cached_part = self._filter_cached(cached, symbol, columns)
+                if not cached_part.is_empty():
+                    df = df.filter(pl.col("date") != cache_date)
+                    common_cols = [c for c in df.columns if c in cached_part.columns]
+                    df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+        return df
+
     def _minute_glob_for(self, asset_type: str) -> str:
         """按资产类型选择分钟K parquet glob。ETF 分钟数据独立存储于 kline_etf_minute。"""
         return self._etf_minute_glob if asset_type == "etf" else self._minute_glob
@@ -1567,8 +1611,18 @@ class KlineRepository:
         trade_date: date,
         asset_type: str = "stock",
     ) -> pl.DataFrame:
-        """分钟K查询 — Polars scan_parquet + predicate pushdown。"""
+        """分钟K查询 — 优先按日期直接读取对应分区 parquet，回退 scan_parquet + pushdown。"""
         try:
+            base_dir = self.store.data_dir / ("kline_etf_minute" if asset_type == "etf" else "kline_minute")
+            part_file = base_dir / f"date={trade_date.isoformat()}" / "part.parquet"
+            if part_file.exists():
+                return guarded_collect(
+                    scan_minute_parquet(str(part_file)).filter(
+                        pl.col("symbol") == symbol
+                    ).sort("datetime")
+                )
+            if not base_dir.exists():
+                return pl.DataFrame()
             return guarded_collect(
                 scan_minute_parquet(self._minute_glob_for(asset_type)).filter(
                     (pl.col("symbol") == symbol)
@@ -1585,14 +1639,20 @@ class KlineRepository:
         trade_date: date,
         asset_type: str = "stock",
     ) -> pl.DataFrame:
-        """批量分钟K查询 — 多 symbol 一次 scan_parquet。
-
-        用于自选列表分时图: 一次 predicate pushdown 读多只股票当日分钟K,
-        避免逐只查询的 N 次 I/O。
-        """
+        """批量分钟K查询 — 优先按日期直接读取对应分区 parquet。"""
         if not symbols:
             return pl.DataFrame()
         try:
+            base_dir = self.store.data_dir / ("kline_etf_minute" if asset_type == "etf" else "kline_minute")
+            part_file = base_dir / f"date={trade_date.isoformat()}" / "part.parquet"
+            if part_file.exists():
+                return guarded_collect(
+                    scan_minute_parquet(str(part_file)).filter(
+                        pl.col("symbol").is_in(symbols)
+                    ).sort(["symbol", "datetime"])
+                )
+            if not base_dir.exists():
+                return pl.DataFrame()
             return guarded_collect(
                 scan_minute_parquet(self._minute_glob_for(asset_type)).filter(
                     pl.col("symbol").is_in(symbols)
@@ -1854,6 +1914,33 @@ class KlineRepository:
     # ================================================================
 
     def latest_minute_date(self, symbol: str, asset_type: str = "stock") -> date | None:
+        # 优先从分区目录探测试探，避免 DuckDB 全表 scan 阻塞
+        base_dir = self.store.data_dir / ("kline_etf_minute" if asset_type == "etf" else "kline_minute")
+        if base_dir.exists():
+            date_dirs = []
+            for entry in base_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith("date="):
+                    try:
+                        d_str = entry.name.split("=", 1)[1]
+                        d = date.fromisoformat(d_str)
+                        date_dirs.append((d, entry / "part.parquet"))
+                    except Exception:
+                        pass
+            date_dirs.sort(key=lambda x: x[0], reverse=True)
+            for d, part_file in date_dirs[:10]:
+                if part_file.exists():
+                    try:
+                        hit = guarded_collect(
+                            scan_minute_parquet(str(part_file))
+                            .filter(pl.col("symbol") == symbol)
+                            .select(pl.col("datetime").max())
+                        )
+                        if not hit.is_empty() and hit["datetime"][0] is not None:
+                            dt_val = hit["datetime"][0]
+                            return dt_val.date() if isinstance(dt_val, datetime) else date.fromisoformat(str(dt_val)[:10])
+                    except Exception:
+                        pass
+
         # 注意: 必须走 execute_one (cursor+close)。直连 self.db.execute(...).fetchone()
         # 的未消费结果集会把首个分区 parquet 的句柄钉在共享连接上, Windows 下阻塞
         # 同步写入的 os.replace → 个股分时"补齐数据"500。
@@ -1871,6 +1958,18 @@ class KlineRepository:
 
     def latest_minute_date_global(self) -> date | None:
         """全市场最近分钟K日期 (不分 symbol)。用于非交易日回退到上一交易日。"""
+        base_dir = self.store.data_dir / "kline_minute"
+        if base_dir.exists():
+            date_dirs = []
+            for entry in base_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith("date="):
+                    try:
+                        d_str = entry.name.split("=", 1)[1]
+                        date_dirs.append(date.fromisoformat(d_str))
+                    except Exception:
+                        pass
+            if date_dirs:
+                return max(date_dirs)
         try:
             row = self.execute_one(
                 "SELECT max(CAST(datetime AS DATE)) FROM kline_minute",
