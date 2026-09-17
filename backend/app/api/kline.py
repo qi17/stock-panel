@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
@@ -24,6 +24,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/kline", tags=["kline"])
 
 
+def _json_safe(value: Any) -> Any:
+    """递归将 dict / list 中的非有限浮点数 (inf, -inf, nan) 转换为 None, 保证符合标准 JSON 规范。"""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _gzip_payload(request: Request, payload: dict, *, pref_key: str) -> dict | Response:
     """大 JSON 响应的传输压缩: 偏好开启 + 客户端接受 gzip + 响应超阈值才压。
 
@@ -32,6 +43,7 @@ def _gzip_payload(request: Request, payload: dict, *, pref_key: str) -> dict | R
     datetime → isoformat, 与 FastAPI jsonable_encoder 输出一致
     (前端 since 增量按字符串字典序比较, 格式必须与非压缩路径相同)。
     """
+    safe_payload = _json_safe(payload)
     from app.services import preferences as _prefs
     _getters = {
         "minute_batch_compress": _prefs.get_minute_batch_compress,
@@ -47,7 +59,7 @@ def _gzip_payload(request: Request, payload: dict, *, pref_key: str) -> dict | R
     headers = getattr(request, "headers", None) or {}
     if compress_on and "gzip" in (headers.get("accept-encoding") or ""):
         raw = json.dumps(
-            payload, ensure_ascii=False, separators=(",", ":"), allow_nan=True,
+            safe_payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
             default=lambda o: o.isoformat() if hasattr(o, "isoformat") else str(o),
         ).encode()
         if len(raw) > 1024:
@@ -56,7 +68,7 @@ def _gzip_payload(request: Request, payload: dict, *, pref_key: str) -> dict | R
                 media_type="application/json",
                 headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
             )
-    return payload
+    return safe_payload
 
 
 def _minute_allowed(capset) -> bool:
@@ -599,11 +611,11 @@ def get_daily_latest(
     repo = request.app.state.repo
     asset_type = repo.resolve_asset_type(symbol)
     row = _latest_live_candle(request, symbol, asset_type, refresh_asset=False)
-    return {
+    return _json_safe({
         "symbol": symbol,
         "row": row,
         "source": "live" if row is not None else "none",
-    }
+    })
 
 
 class DailyBatchRequest:

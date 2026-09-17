@@ -497,21 +497,54 @@ def compute_indicators(
         # 标准量比(同花顺/东财): 今日成交量 / 前5日均量(不含当天)
         # 盘后全量路径: 当日 volume 是完整全天量, 无需时间折算
         df = df.with_columns(
-            (pl.col("volume") / pl.col("_vol_ma5_prev")).alias("vol_ratio_5d"),
+            pl.when(pl.col("_vol_ma5_prev") > 0)
+            .then(pl.col("volume") / pl.col("_vol_ma5_prev"))
+            .otherwise(None)
+            .alias("vol_ratio_5d"),
         )
     _p4mom: list[pl.Expr] = []
     if "momentum_5d" in want:
-        _p4mom.append((pl.col("close") / pl.col("close").shift(5).over("symbol") - 1).alias("momentum_5d"))
+        _p4mom.append(
+            pl.when(pl.col("close").shift(5).over("symbol") > 0)
+            .then(pl.col("close") / pl.col("close").shift(5).over("symbol") - 1)
+            .otherwise(None)
+            .alias("momentum_5d")
+        )
     if "momentum_10d" in want:
-        _p4mom.append((pl.col("close") / pl.col("close").shift(10).over("symbol") - 1).alias("momentum_10d"))
+        _p4mom.append(
+            pl.when(pl.col("close").shift(10).over("symbol") > 0)
+            .then(pl.col("close") / pl.col("close").shift(10).over("symbol") - 1)
+            .otherwise(None)
+            .alias("momentum_10d")
+        )
     if "momentum_20d" in want:
-        _p4mom.append((pl.col("close") / pl.col("close").shift(20).over("symbol") - 1).alias("momentum_20d"))
+        _p4mom.append(
+            pl.when(pl.col("close").shift(20).over("symbol") > 0)
+            .then(pl.col("close") / pl.col("close").shift(20).over("symbol") - 1)
+            .otherwise(None)
+            .alias("momentum_20d")
+        )
     if "momentum_30d" in want:
-        _p4mom.append((pl.col("close") / pl.col("close").shift(30).over("symbol") - 1).alias("momentum_30d"))
+        _p4mom.append(
+            pl.when(pl.col("close").shift(30).over("symbol") > 0)
+            .then(pl.col("close") / pl.col("close").shift(30).over("symbol") - 1)
+            .otherwise(None)
+            .alias("momentum_30d")
+        )
     if "momentum_60d" in want:
-        _p4mom.append((pl.col("close") / pl.col("close").shift(60).over("symbol") - 1).alias("momentum_60d"))
+        _p4mom.append(
+            pl.when(pl.col("close").shift(60).over("symbol") > 0)
+            .then(pl.col("close") / pl.col("close").shift(60).over("symbol") - 1)
+            .otherwise(None)
+            .alias("momentum_60d")
+        )
     if "change_pct" in want:
-        _p4mom.append((pl.col("close") / pl.col("close").shift(1).over("symbol") - 1).alias("change_pct"))
+        _p4mom.append(
+            pl.when(pl.col("close").shift(1).over("symbol") > 0)
+            .then(pl.col("close") / pl.col("close").shift(1).over("symbol") - 1)
+            .otherwise(None)
+            .alias("change_pct")
+        )
     if _p4mom:
         df = df.with_columns(_p4mom)
     if "change_amount" in want:
@@ -568,6 +601,17 @@ def compute_indicators(
                   "_rsi_avg_gain_14", "_rsi_avg_loss_14",
                   "_rsi_avg_gain_24", "_rsi_avg_loss_24"]
     df = df.drop([c for c in _temp_cols if c in df.columns])
+
+    # 清理 NaN / Inf
+    float_cols = [c for c in df.columns if df[c].dtype.is_float()]
+    if float_cols:
+        df = df.with_columns([
+            pl.when(pl.col(c).is_nan() | pl.col(c).is_infinite())
+              .then(None)
+              .otherwise(pl.col(c))
+              .alias(c)
+            for c in float_cols
+        ])
 
     _elapsed = (_time.perf_counter() - _t0) * 1000
     import logging as _logging
@@ -1950,7 +1994,12 @@ def compute_enriched_today(
 
     # change_pct / change_amount / amplitude: 有则直接用, 无则计算
     if "change_pct" not in df.columns:
-        df = df.with_columns((pl.col("close") / pl.col("prev_close") - 1).alias("change_pct"))
+        df = df.with_columns(
+            pl.when(pl.col("prev_close") > 0)
+            .then(pl.col("close") / pl.col("prev_close") - 1)
+            .otherwise(None)
+            .alias("change_pct")
+        )
     if "change_amount" not in df.columns:
         df = df.with_columns((pl.col("close") - pl.col("prev_close")).alias("change_amount"))
     if "amplitude" not in df.columns:
@@ -2004,9 +2053,10 @@ def compute_enriched_today(
     # ---- KDJ (递推) ----
     kdj_ln = pl.min_horizontal(pl.col("_kdj_8d_low"), pl.col("low"))
     kdj_hn = pl.max_horizontal(pl.col("_kdj_8d_high"), pl.col("high"))
-    rsv = (pl.col("close") - kdj_ln) / (kdj_hn - kdj_ln).fill_null(1e-12) * 100
-    k_today = rsv / 3 + pl.col("kdj_k") * 2 / 3
-    d_today = k_today / 3 + pl.col("kdj_d") * 2 / 3
+    _kdj_range = kdj_hn - kdj_ln
+    rsv = pl.when(_kdj_range > 0).then((pl.col("close") - kdj_ln) / _kdj_range * 100).otherwise(None)
+    k_today = pl.when(rsv.is_not_null()).then(rsv / 3 + pl.col("kdj_k") * 2 / 3).otherwise(pl.col("kdj_k"))
+    d_today = pl.when(k_today.is_not_null()).then(k_today / 3 + pl.col("kdj_d") * 2 / 3).otherwise(pl.col("kdj_d"))
     df = df.with_columns([
         k_today.alias("kdj_k"),
         d_today.alias("kdj_d"),
@@ -2053,7 +2103,10 @@ def compute_enriched_today(
     df = df.with_columns([
         vol_ma5.alias("vol_ma5"),
         vol_ma10.alias("vol_ma10"),
-        ((pl.col("volume") * time_factor) / vol_ma5_prev).alias("vol_ratio_5d"),
+        pl.when(vol_ma5_prev > 0)
+        .then((pl.col("volume") * time_factor) / vol_ma5_prev)
+        .otherwise(None)
+        .alias("vol_ratio_5d"),
     ])
 
     # ---- 极值 60 日 ----
@@ -2070,22 +2123,22 @@ def compute_enriched_today(
 
     # ---- 动量 (5d/10d/20d/30d/60d) ----
     df = df.with_columns([
-        (pl.col("close") / pl.col("_close_5d_ago") - 1).alias("momentum_5d"),
-        (pl.col("close") / pl.col("_close_10d_ago") - 1).alias("momentum_10d"),
-        (pl.col("close") / pl.col("_close_20d_ago") - 1).alias("momentum_20d"),
-        (pl.col("close") / pl.col("_close_30d_ago") - 1).alias("momentum_30d"),
-        (pl.col("close") / pl.col("_close_60d_ago") - 1).alias("momentum_60d"),
+        pl.when(pl.col("_close_5d_ago") > 0).then(pl.col("close") / pl.col("_close_5d_ago") - 1).otherwise(None).alias("momentum_5d"),
+        pl.when(pl.col("_close_10d_ago") > 0).then(pl.col("close") / pl.col("_close_10d_ago") - 1).otherwise(None).alias("momentum_10d"),
+        pl.when(pl.col("_close_20d_ago") > 0).then(pl.col("close") / pl.col("_close_20d_ago") - 1).otherwise(None).alias("momentum_20d"),
+        pl.when(pl.col("_close_30d_ago") > 0).then(pl.col("close") / pl.col("_close_30d_ago") - 1).otherwise(None).alias("momentum_30d"),
+        pl.when(pl.col("_close_60d_ago") > 0).then(pl.col("close") / pl.col("_close_60d_ago") - 1).otherwise(None).alias("momentum_60d"),
     ])
 
     # ---- 动量 3d (异动偏离 deviate_3d 用; 旧 live_agg 未带该状态时跳过, 偏离列自然置 null) ----
     if "_close_3d_ago" in df.columns:
         df = df.with_columns(
-            (pl.col("close") / pl.col("_close_3d_ago") - 1).alias("momentum_3d")
+            pl.when(pl.col("_close_3d_ago") > 0).then(pl.col("close") / pl.col("_close_3d_ago") - 1).otherwise(None).alias("momentum_3d")
         )
 
     # ---- 年化波动率 20d (递推) ----
     # 用 Welford 简化: sum + sum_sq of 19 historical returns + today's return
-    today_ret = pl.col("close") / pl.col("prev_close") - 1
+    today_ret = pl.when(pl.col("prev_close") > 0).then(pl.col("close") / pl.col("prev_close") - 1).otherwise(0.0)
     total_sum = pl.col("_vol_19d_pct_sum").fill_null(0.0) + today_ret
     total_sq_sum = pl.col("_vol_19d_pct_sq_sum").fill_null(0.0) + today_ret ** 2
     vol_mean = total_sum / 20

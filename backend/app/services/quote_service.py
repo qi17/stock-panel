@@ -939,7 +939,7 @@ class QuoteService:
         else:
             symbols = preferences.get_realtime_watchlist_symbols()
 
-        fetch_symbols = list(dict.fromkeys([*symbols, *self.CORE_INDEX_SYMBOLS]))
+        fetch_symbols = list(dict.fromkeys([*symbols, *CORE_INDEX_SYMBOLS]))
         if not fetch_symbols:
             logger.info("自选实时未配置标的, 跳过行情拉取")
             return
@@ -1013,7 +1013,7 @@ class QuoteService:
                 "session": q.get("session"),
             })
 
-        all_index_symbols = set(self.CORE_INDEX_SYMBOLS)
+        all_index_symbols = set(CORE_INDEX_SYMBOLS)
         if self._repo:
             all_index_symbols.update(self._repo.get_index_symbol_set())
 

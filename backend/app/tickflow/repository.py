@@ -1698,6 +1698,15 @@ class KlineRepository:
                 instruments,
                 historical_shares=self.get_historical_shares(),
             )
+            float_cols = [c for c in df.columns if df[c].dtype.is_float()]
+            if float_cols:
+                df = df.with_columns([
+                    pl.when(pl.col(c).is_nan() | pl.col(c).is_infinite())
+                      .then(None)
+                      .otherwise(pl.col(c))
+                      .alias(c)
+                    for c in float_cols
+                ])
         except Exception as e:  # noqa: BLE001
             logger.warning("on-demand compute failed: %s", e)
         return df
@@ -1710,6 +1719,15 @@ class KlineRepository:
         try:
             df = compute_indicators(df)
             df = compute_signals(df)
+            float_cols = [c for c in df.columns if df[c].dtype.is_float()]
+            if float_cols:
+                df = df.with_columns([
+                    pl.when(pl.col(c).is_nan() | pl.col(c).is_infinite())
+                      .then(None)
+                      .otherwise(pl.col(c))
+                      .alias(c)
+                    for c in float_cols
+                ])
         except Exception as e:  # noqa: BLE001
             logger.warning("index on-demand compute failed: %s", e)
         return df
